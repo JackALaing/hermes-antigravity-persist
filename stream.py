@@ -172,6 +172,43 @@ def _path_is_native_media_target(path: str, referenced: set[str]) -> bool:
     return False
 
 
+class _StepUsage:
+    """Usage reported by this turn's ``step_update`` events.
+
+    agy attaches a ``usage`` object to each finished model step. Each object
+    covers that one step: ``input_tokens`` excludes cache reads, so the
+    context the step actually saw is ``input_tokens + cache_read_tokens``.
+    The last step's context is the turn's prompt size, and the turn's output
+    is the sum of every step's ``output_tokens``. Unlike ``result.usage``,
+    these values never accumulate across turns of a persistent process.
+    """
+
+    __slots__ = ("seen", "last_input", "last_cache_read", "output_sum", "first_context")
+
+    def __init__(self) -> None:
+        self.seen = False
+        self.last_input = 0
+        self.last_cache_read = 0
+        self.output_sum = 0
+        self.first_context = 0
+
+    def add(self, usage: Any) -> None:
+        if not isinstance(usage, dict):
+            return
+        input_tokens = int(usage.get("input_tokens") or 0)
+        cache_read = int(usage.get("cache_read_tokens") or 0)
+        if not self.seen:
+            self.first_context = input_tokens + cache_read
+        self.seen = True
+        self.last_input = input_tokens
+        self.last_cache_read = cache_read
+        self.output_sum += int(usage.get("output_tokens") or 0)
+
+    @property
+    def context_tokens(self) -> int:
+        return self.last_input + self.last_cache_read
+
+
 class _UsageDeltas(NamedTuple):
     """Per-turn usage derived from cumulative worker-session counters."""
 
@@ -354,6 +391,7 @@ class AntigravityStream(Iterator[Any]):
         delivery_sample_key: str = "",
         followup_segments: list[str] | None = None,
         close_stdin_after_segments: bool = False,
+        pending_lines: list[str] | None = None,
     ):
         # Loud pairing, not a defaulted bool (review nit): a future site
         # passing worker_lock WITHOUT worker_lock_held would silently never
@@ -428,6 +466,15 @@ class AntigravityStream(Iterator[Any]):
         self._corrections_sent = 0
         self._yielded_call_keys: set[tuple[str, str]] = set()
         self.conversation_id = ""
+        # stdout lines a caller already read from this process (the init
+        # handshake read while validating a resumed conversation); replayed
+        # before any new read so the stream sees the process's whole output.
+        self._pending_lines: list[str] = list(pending_lines or [])
+        # Exactly what this stream hands the host: the reply fingerprint of a
+        # persistent conversation is computed from it (see persist.py).
+        self.reply_content_parts: list[str] = []
+        self.reply_tool_calls: list[Any] = []
+        self.step_usage = _StepUsage()
         self._closed = False
         self._interrupted = False
         self._finished = False
@@ -729,6 +776,10 @@ class AntigravityStream(Iterator[Any]):
         tool_calls: list[Any] | None = None,
         finish_reason: str | None = None,
     ) -> Any:
+        if content:
+            self.reply_content_parts.append(content)
+        if tool_calls:
+            self.reply_tool_calls.extend(tool_calls)
         delta = SimpleNamespace(
             role="assistant",
             content=content,
@@ -749,26 +800,68 @@ class AntigravityStream(Iterator[Any]):
         )
 
     def _usage_totals(self, usage_data: dict[str, Any]) -> tuple[int, int, int, int]:
-        """(input, output, total, cached) token counts for the usage chunk.
+        """(prompt, completion, total, cached) token counts for the usage chunk.
 
-        Persistent worker sessions report cumulative usage, so worker streams
-        forward per-turn deltas against their session baseline. Oneshot
-        processes already report per-turn usage and are forwarded raw; they
-        never touch the worker baseline.
+        ``prompt_tokens`` includes cache reads: Hermes subtracts
+        ``cached_tokens`` from it to price the uncached part, so an
+        uncached-only prompt count made the context size read low.
+
+        The turn's own ``step_update`` usage is preferred (see _StepUsage).
+        Without it, worker streams fall back to the cumulative
+        ``result.usage`` minus their session baseline -- raw cumulative
+        counters are never forwarded on the worker path -- and oneshot
+        processes, which report one turn per process, are used as reported.
+        Worker streams advance the baseline from ``result.usage`` either way,
+        so a later fallback turn still measures only itself.
         """
         if self.is_worker and self.usage_baseline is not None:
             deltas = _delta_worker_usage(usage_data, self.usage_baseline)
-            return (
-                deltas.input_tokens,
+            fallback = (
+                deltas.input_tokens + deltas.cache_read_tokens,
                 deltas.output_tokens,
-                deltas.total_tokens,
                 deltas.cache_read_tokens,
             )
-        input_tokens = int(usage_data.get("input_tokens", 0) or 0)
-        output_tokens = int(usage_data.get("output_tokens", 0) or 0)
-        total_tokens = int(usage_data.get("total_tokens", input_tokens + output_tokens) or 0)
-        cached_tokens = int(usage_data.get("cache_read_tokens", 0) or 0)
-        return input_tokens, output_tokens, total_tokens, cached_tokens
+        else:
+            input_tokens = int(usage_data.get("input_tokens", 0) or 0)
+            cached_tokens = int(usage_data.get("cache_read_tokens", 0) or 0)
+            fallback = (
+                input_tokens + cached_tokens,
+                int(usage_data.get("output_tokens", 0) or 0),
+                cached_tokens,
+            )
+        step = self.step_usage
+        if step.seen:
+            prompt_tokens, completion_tokens, cached_tokens = (
+                step.context_tokens,
+                step.output_sum,
+                step.last_cache_read,
+            )
+        else:
+            prompt_tokens, completion_tokens, cached_tokens = fallback
+        return prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, cached_tokens
+
+    def reply_message(self) -> dict[str, Any]:
+        """The assistant message this stream delivered, in Hermes' shape."""
+        tool_calls = []
+        for call in self.reply_tool_calls:
+            function = getattr(call, "function", None)
+            tool_calls.append(
+                {
+                    "id": getattr(call, "id", ""),
+                    "type": "function",
+                    "function": {
+                        "name": getattr(function, "name", ""),
+                        "arguments": getattr(function, "arguments", "{}"),
+                    },
+                }
+            )
+        message: dict[str, Any] = {
+            "role": "assistant",
+            "content": "".join(self.reply_content_parts),
+        }
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+        return message
 
     def _empty_result_message(
         self,
@@ -1136,7 +1229,10 @@ class AntigravityStream(Iterator[Any]):
                 if self._early_error:
                     raise RuntimeError(f"Antigravity model error: {self._early_error}")
 
-                line = self.proc.stdout.readline() if self.proc.stdout else ""
+                if self._pending_lines:
+                    line = self._pending_lines.pop(0)
+                else:
+                    line = self.proc.stdout.readline() if self.proc.stdout else ""
                 self._raise_if_cancelled()
                 if self._early_error:
                     raise RuntimeError(f"Antigravity model error: {self._early_error}")
@@ -1254,6 +1350,7 @@ class AntigravityStream(Iterator[Any]):
                             break
                     if "usage" in step:
                         usage_data = step["usage"]
+                        self.step_usage.add(step["usage"])
 
                     text_delta = step.get("text_delta")
                     if text_delta:
@@ -1692,10 +1789,22 @@ class AntigravityStream(Iterator[Any]):
             # Include cache reads conservatively; never change reported usage.
             watch = self.delivery_watch
             if watch is not None and self.prompt_chars:
+                # prompt tokens already include cache reads.
                 watch.observe(
-                    self.prompt_chars, input_tokens + cached_tokens,
+                    self.prompt_chars, input_tokens,
                     sample_key=self.delivery_sample_key,
                 )
+
+            # A persistent conversation commits its record and releases its
+            # cross-process lock here, before the finish chunk: a consumer
+            # that stops at the finish reason may never resume this
+            # generator, and the next turn must not wait for its collection.
+            on_success = getattr(self.client, "_on_worker_turn_success", None)
+            if self.is_worker and success and callable(on_success):
+                try:
+                    on_success(self, self.step_usage, usage_data)
+                except Exception:
+                    logger.warning("Persistent turn commit failed", exc_info=True)
 
             if neutralized_tool_step:
                 # Issue #52: the security abort carries its explanation and

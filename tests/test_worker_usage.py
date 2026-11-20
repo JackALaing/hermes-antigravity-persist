@@ -318,20 +318,21 @@ class WorkerTurnUsageTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(usage1.prompt_tokens, 100)
+        # prompt_tokens = uncached input delta + cache-read delta.
+        self.assertEqual(usage1.prompt_tokens, 105)
         self.assertEqual(usage1.completion_tokens, 10)
         self.assertEqual(usage1.prompt_tokens_details.cached_tokens, 5)
-        self.assertEqual(usage1.total_tokens, 110)  # fallback: 100 + 10
+        self.assertEqual(usage1.total_tokens, 115)  # 105 + 10
 
         self.assertEqual(usage2.prompt_tokens, 150)
         self.assertEqual(usage2.completion_tokens, 30)  # 40 - 10
         self.assertEqual(usage2.prompt_tokens_details.cached_tokens, 0)
-        self.assertEqual(usage2.total_tokens, 180)  # fallback: 150 + 30
+        self.assertEqual(usage2.total_tokens, 180)  # 150 + 30
 
-        self.assertEqual(usage3.prompt_tokens, 150)
+        self.assertEqual(usage3.prompt_tokens, 175)  # 150 + (30 - 5)
         self.assertEqual(usage3.completion_tokens, 0)
         self.assertEqual(usage3.prompt_tokens_details.cached_tokens, 25)  # 30 - 5
-        self.assertEqual(usage3.total_tokens, 150)  # fallback: 150 + 0
+        self.assertEqual(usage3.total_tokens, 175)  # 175 + 0
 
         self.assertEqual(
             client._worker_usage_baseline,

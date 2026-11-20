@@ -87,8 +87,9 @@ class ResumedWorkerUsageTests(unittest.TestCase):
             u3 = self._create(client, MESSAGES_TURN_3)
             argv = [c.args[0] for c in popen.call_args_list if c.args[0][0] == "agy"][1]
             self.assertEqual(argv[argv.index("--conversation") + 1], "conv-1")
-        self.assertEqual((u1.prompt_tokens, u2.prompt_tokens), (66_916, 2_270))
-        self.assertEqual(u3.prompt_tokens, 2_377)
+        # prompt_tokens includes cache reads (stream._usage_totals).
+        self.assertEqual((u1.prompt_tokens, u2.prompt_tokens), (66_916, 2_270 + 64_859))
+        self.assertEqual(u3.prompt_tokens, 2_377 + 65_080)  # the 67,457-token context
         self.assertEqual(u3.prompt_tokens_details.cached_tokens, 65_080)
         self.assertEqual(u3.completion_tokens, 75)
         self.assertIsNone(client._resume_usage_baseline)
@@ -103,7 +104,7 @@ class ResumedWorkerUsageTests(unittest.TestCase):
             self._create(client, MESSAGES_TURN_1)
             client._reap_idle_worker(client._worker_proc)
             u2 = self._create(client, MESSAGES_TURN_2)
-        self.assertEqual(u2.prompt_tokens, 800)
+        self.assertEqual(u2.prompt_tokens, 800 + 4_000)
         self.assertEqual(u2.prompt_tokens_details.cached_tokens, 4_000)
 
     def test_fresh_conversation_does_not_inherit_a_snapshot(self):
