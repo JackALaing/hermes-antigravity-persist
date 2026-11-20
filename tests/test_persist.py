@@ -462,6 +462,74 @@ class StoreTests(unittest.TestCase):
         self.assertIsNotNone(self.store.load("new"))
         self.assertFalse((conv_dir / "old-conv.db").exists())
 
+    def _touch(self, path, age=0.0, text="x"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        when = time.time() - age
+        os.utime(path, (when, when))
+        return path
+
+    def test_delete_conversation_removes_brain_and_annotations(self):
+        g = self.store.gemini_dir
+        cid = "71bce5e9-0691-4c20-8e15-a40b154820cd"
+        db = self._touch(g / "conversations" / f"{cid}.db")
+        wal = self._touch(g / "conversations" / f"{cid}.db-wal")
+        ann = self._touch(g / "annotations" / f"{cid}.pbtxt")
+        transcript = self._touch(g / "brain" / cid / ".system_generated" / "logs" / "overview.txt")
+        other = self._touch(g / "brain" / "25ea8570-0199-42e0-8080-5b2160db9f02" / "x.txt")
+        outside = self._touch(Path(self.tmp.name) / "outside" / "keep.txt")
+        os.symlink(outside.parent, g / "brain" / cid / "link")
+        self.store.delete_conversation(cid)
+        for gone in (db, wal, ann, transcript.parents[2]):
+            self.assertFalse(gone.exists(), gone)
+        self.assertTrue(other.exists())
+        self.assertTrue(outside.exists(), "symlinks are not followed")
+
+    def test_gc_removes_orphans_old_logs_implicit_and_idle_locks(self):
+        g = self.store.gemini_dir
+        day = persist.ORPHAN_MAX_AGE_SECONDS
+        live = "aaaaaaaa-0000-0000-0000-000000000001"
+        orphan = "bbbbbbbb-0000-0000-0000-000000000002"
+        fresh_orphan = "cccccccc-0000-0000-0000-000000000003"
+        self.store.save(_record(REPLY, scope_hash="livekey", agy_conversation_id=live))
+        live_db = self._touch(g / "conversations" / f"{live}.db", age=10 * day)
+        live_brain = self._touch(g / "brain" / live / "t.txt", age=10 * day)
+        orphan_db = self._touch(g / "conversations" / f"{orphan}.db", age=2 * day)
+        orphan_brain = self._touch(g / "brain" / orphan / "t.txt", age=2 * day)
+        os.utime(orphan_brain.parent, (time.time() - 2 * day, time.time() - 2 * day))
+        fresh_db = self._touch(g / "conversations" / f"{fresh_orphan}.db", age=60)
+        brain_only = "dddddddd-0000-0000-0000-000000000004"
+        brain_only_file = self._touch(g / "brain" / brain_only / "new.txt", age=60)
+        os.utime(brain_only_file.parent, (time.time() - 3 * day, time.time() - 3 * day))
+        old_log = self._touch(g / "log" / "cli-20261101_000000.log", age=4 * day)
+        new_log = self._touch(g / "log" / "cli-20261120_000000.log", age=3600)
+        old_pb = self._touch(g / "implicit" / "e1.pb", age=15 * day)
+        new_pb = self._touch(g / "implicit" / "e2.pb", age=day)
+        idle_lock = self._touch(self.store.lock_path("gonekey"), age=2 * day)
+        live_lock = self._touch(self.store.lock_path("livekey"), age=20 * day)
+        held_lock = self._touch(self.store.lock_path("heldkey"), age=2 * day)
+        holder = ConversationLock(held_lock)
+        self.assertTrue(holder.acquire(0))
+        os.utime(held_lock, (time.time() - 2 * day, time.time() - 2 * day))
+        try:
+            self.assertEqual(self.store.gc(), 0)
+        finally:
+            holder.release()
+        for kept in (live_db, live_brain, fresh_db, brain_only_file, new_log, new_pb, live_lock, held_lock):
+            self.assertTrue(kept.exists(), kept)
+        for gone in (orphan_db, orphan_brain.parent, old_log, old_pb, idle_lock):
+            self.assertFalse(gone.exists(), gone)
+
+    def test_gc_of_an_old_record_removes_its_brain_directory(self):
+        g = self.store.gemini_dir
+        cid = "eeeeeeee-0000-0000-0000-000000000005"
+        brain = self._touch(g / "brain" / cid / "t.txt")
+        self.store.save(_record(REPLY, scope_hash="old", agy_conversation_id=cid))
+        past = time.time() - persist.RECORD_MAX_AGE_SECONDS - 10
+        os.utime(self.store.record_path("old"), (past, past))
+        self.assertEqual(self.store.gc(), 1)
+        self.assertFalse(brain.parent.exists())
+
     def test_kill_9_during_writes_never_leaves_a_corrupt_record(self):
         script = textwrap.dedent(f"""
             import sys

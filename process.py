@@ -12,6 +12,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 from collections import deque
 from pathlib import Path
@@ -86,6 +87,32 @@ def write_media_read_permissions(
     full media-rule set now present in the file.
     """
     settings_path = Path(isolated_gemini_dir) / "settings.json"
+    # Persistent conversations share one isolated home, so concurrent turns
+    # can update this file at once: serialize the read-modify-write (or one
+    # turn's rules are lost) and give every writer its own temp file.
+    with _settings_lock(settings_path):
+        return _merge_media_rules(settings_path, paths, isolated_gemini_dir)
+
+
+@contextlib.contextmanager
+def _settings_lock(settings_path: Path):
+    fd = None
+    try:
+        fd = os.open(str(settings_path) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except (OSError, ImportError):  # no flock (Windows): best effort, as before
+        pass
+    try:
+        yield
+    finally:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
+def _merge_media_rules(settings_path: Path, paths: Any, isolated_gemini_dir: Any) -> frozenset[str]:
     try:
         settings = _json.loads(settings_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -107,9 +134,15 @@ def write_media_read_permissions(
                 existing.add(rule)
     permissions["allow"] = allow
     settings["permissions"] = permissions
-    tmp_path = settings_path.with_suffix(".json.tmp")
-    tmp_path.write_text(_json.dumps(settings, indent=1), encoding="utf-8")
-    os.replace(tmp_path, settings_path)
+    fd, tmp_name = tempfile.mkstemp(prefix="settings.", suffix=".json.tmp", dir=str(settings_path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(_json.dumps(settings, indent=1))
+        os.replace(tmp_name, settings_path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
     return read_media_rules(isolated_gemini_dir)
 
 

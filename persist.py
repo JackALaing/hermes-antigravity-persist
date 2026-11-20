@@ -32,6 +32,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -93,6 +94,12 @@ PREFIX_MAX_BYTES = 170_000
 _HEADER_RESERVE = 2_048
 LOCK_TIMEOUT_SECONDS = 30.0
 RECORD_MAX_AGE_SECONDS = 14 * 24 * 3600
+# agy's own logs in the shared persistent home (one per worker process).
+LOG_MAX_AGE_SECONDS = 3 * 24 * 3600
+# A conversation, brain directory or lock no record names, untouched this long,
+# is left over from a crash or an unrecorded turn (live ones are written to on
+# every turn, and an in-flight turn's conversation is minutes old at most).
+ORPHAN_MAX_AGE_SECONDS = 24 * 3600
 
 SEED_HEADER = (
     "[CONTEXT ONLY - PART {k} OF {n}. This message restores earlier conversation state. "
@@ -283,38 +290,99 @@ class PersistStore:
             logger.warning("Could not mark Antigravity record for refresh", exc_info=True)
 
     def delete_conversation(self, conversation_id: str | None) -> None:
+        """Delete one agy conversation and its per-conversation artefacts.
+
+        agy keeps the conversation database under ``conversations/``, a
+        transcript and scratch directory under ``brain/<id>`` and annotations
+        under ``annotations/``. Symlinks are never followed.
+        """
         if not conversation_id or not re.fullmatch(r"[A-Za-z0-9_-]+", conversation_id):
             return
-        conv_dir = self.gemini_dir / "conversations"
-        for entry in conv_dir.glob(f"{conversation_id}.db*"):
-            with contextlib.suppress(OSError):
-                if entry.is_file() and not entry.is_symlink():
-                    entry.unlink()
+        for sub, pattern in (("conversations", f"{conversation_id}.db*"),
+                             ("annotations", f"{conversation_id}.*")):
+            for entry in (self.gemini_dir / sub).glob(pattern):
+                with contextlib.suppress(OSError):
+                    if entry.is_file() and not entry.is_symlink():
+                        entry.unlink()
+        brain = self.gemini_dir / "brain" / conversation_id
+        if brain.is_dir() and not brain.is_symlink():
+            shutil.rmtree(brain, ignore_errors=True)
 
     def gc(self, now: float | None = None) -> int:
-        """Drop records (and their conversations) idle for over 14 days."""
+        """Housekeeping for the shared persistent home; returns records removed.
+
+        Drops records idle for over 14 days with their conversations, agy logs
+        over 3 days old, implicit-context and crash files over 14 days old, and
+        conversations, brain directories and locks that no record names and
+        nobody has touched for a day.
+        """
         now = time.time() if now is None else now
         removed = 0
-        if not self.records_dir.is_dir():
-            return 0
-        for path in self.records_dir.iterdir():
-            try:
-                age = now - path.stat().st_mtime
-            except OSError:
-                continue
-            if path.name.startswith(".tmp-"):
-                if age > 3600:
-                    with contextlib.suppress(OSError):
-                        path.unlink()
-                continue
-            if path.suffix != ".json" or age <= RECORD_MAX_AGE_SECONDS:
-                continue
-            record = self.load(path.stem) or {}
-            self.delete_conversation(record.get("agy_conversation_id"))
-            with contextlib.suppress(OSError):
-                path.unlink()
-                removed += 1
+        live_ids: set[str] = set()
+        live_keys: set[str] = set()
+        if self.records_dir.is_dir():
+            for path in self.records_dir.iterdir():
+                age = _age(path, now)
+                if age is None:
+                    continue
+                if path.name.startswith(".tmp-"):
+                    if age > 3600:
+                        with contextlib.suppress(OSError):
+                            path.unlink()
+                    continue
+                if path.suffix != ".json":
+                    continue
+                record = self.load(path.stem) or {}
+                if age <= RECORD_MAX_AGE_SECONDS:
+                    live_keys.add(path.stem)
+                    if record.get("agy_conversation_id"):
+                        live_ids.add(str(record["agy_conversation_id"]))
+                    continue
+                self.delete_conversation(record.get("agy_conversation_id"))
+                with contextlib.suppress(OSError):
+                    path.unlink()
+                    removed += 1
+        self._gc_orphans(now, live_ids, live_keys)
         return removed
+
+    def _gc_orphans(self, now: float, live_ids: set[str], live_keys: set[str]) -> None:
+        def expire(directory: Path, pattern: str, max_age: float) -> None:
+            for entry in directory.glob(pattern):
+                age = _age(entry, now)
+                if age is not None and age > max_age and entry.is_file() and not entry.is_symlink():
+                    with contextlib.suppress(OSError):
+                        entry.unlink()
+
+        expire(self.gemini_dir / "log", "cli-*.log", LOG_MAX_AGE_SECONDS)
+        expire(self.gemini_dir / "implicit", "*.pb", RECORD_MAX_AGE_SECONDS)
+        expire(self.gemini_dir / "crashes", "*", RECORD_MAX_AGE_SECONDS)
+
+        orphans: set[str] = set()
+        for entry in (self.gemini_dir / "conversations").glob("*.db"):
+            if entry.stem not in live_ids and (_age(entry, now) or 0) > ORPHAN_MAX_AGE_SECONDS:
+                orphans.add(entry.stem)
+        brain_dir = self.gemini_dir / "brain"
+        if brain_dir.is_dir():
+            for entry in brain_dir.iterdir():
+                if (entry.is_dir() and not entry.is_symlink() and entry.name not in live_ids
+                        and re.fullmatch(r"[0-9a-f-]{36}", entry.name)
+                        and (_tree_age(entry, now) or 0) > ORPHAN_MAX_AGE_SECONDS):
+                    orphans.add(entry.name)
+        for conversation_id in orphans:
+            logger.info("Removing orphaned Antigravity conversation %s", conversation_id[:8])
+            self.delete_conversation(conversation_id)
+
+        if self.locks_dir.is_dir():
+            for entry in self.locks_dir.glob("*.lock"):
+                if entry.stem in live_keys or (_age(entry, now) or 0) <= ORPHAN_MAX_AGE_SECONDS:
+                    continue
+                lock = ConversationLock(entry)
+                if lock.acquire(0):  # never unlink a lock someone holds
+                    try:
+                        with contextlib.suppress(OSError):
+                            entry.unlink()
+                    finally:
+                        lock.release()
 
 
 class ConversationLock:
@@ -365,6 +433,27 @@ class ConversationLock:
     def __del__(self) -> None:  # an abandoned stream must not hold it forever
         with contextlib.suppress(Exception):
             self.release()
+
+
+def _age(path: Path, now: float) -> float | None:
+    try:
+        return now - path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def _tree_age(directory: Path, now: float) -> float | None:
+    """Age of the newest entry in a directory tree (agy writes into brain/<id>)."""
+    newest = None
+    try:
+        for root, dirs, files in os.walk(directory):
+            for name in [*dirs, *files, "."]:
+                with contextlib.suppress(OSError):
+                    mtime = os.lstat(os.path.join(root, name)).st_mtime
+                    newest = mtime if newest is None else max(newest, mtime)
+    except OSError:
+        return None
+    return None if newest is None else now - newest
 
 
 # --------------------------------------------------------------------------

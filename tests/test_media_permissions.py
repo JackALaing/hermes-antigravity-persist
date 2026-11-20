@@ -302,3 +302,30 @@ def test_empty_media_does_not_write_or_recycle(worker, monkeypatch):
     write.assert_not_called()
     cl._terminate_process.assert_not_called()
     assert cl._worker_proc is proc
+
+
+def test_concurrent_writers_keep_every_rule_and_leave_no_temp_files(tmp_path):
+    # Persistent conversations share one isolated home: concurrent turns must
+    # not lose each other's rules or collide on one temp file name.
+    import threading
+
+    errors = []
+
+    def writer(i):
+        try:
+            for j in range(10):
+                write_media_read_permissions(tmp_path, {f"/media/{i}-{j}.png"})
+        except Exception as exc:  # pragma: no cover - reported below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    rules = read_media_rules(tmp_path)
+    for i in range(8):
+        for j in range(10):
+            assert f"read_file(/media/{i}-{j}.png)" in rules
+    assert not list(tmp_path.glob("*.tmp"))
