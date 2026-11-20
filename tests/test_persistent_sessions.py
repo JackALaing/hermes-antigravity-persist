@@ -21,6 +21,7 @@ plugin_dir = Path(__file__).resolve().parent.parent
 if str(plugin_dir) not in sys.path:
     sys.path.insert(0, str(plugin_dir))
 
+import models  # noqa: E402
 import persist  # noqa: E402
 import session  # noqa: E402
 import stream as stream_mod  # noqa: E402
@@ -118,6 +119,8 @@ class FakeAgy:
             reply = self.world.next_reply()
         n = len(self.world.conversations[self.conversation])
         usage = {"input_tokens": 100 * n, "output_tokens": 7, "cache_read_tokens": 1000 * n}
+        if self.world.real_usage and not seed:
+            usage = dict(self.world.real_usage)
         step = {"conversation_id": self.conversation, "step_type": "agent_response",
                 "text_delta": reply}
         if not self.world.no_step_usage:
@@ -143,9 +146,17 @@ class World:
         self.seed_tool = False
         self.lose_conversations = False
         self.no_step_usage = False
+        # Step usage for real (non-seed) turns, to give agy's conversation a
+        # chosen size; None keeps the per-message default.
+        self.real_usage = None
 
     def next_reply(self):
         return self.replies.pop(0) if self.replies else f"reply {len(self.procs)}"
+
+    @property
+    def workers(self):
+        """agy conversation processes (not ``agy models`` catalog lookups)."""
+        return [p for p in self.procs if "stream-json" in p.cmd]
 
     def popen(self, cmd, **kwargs):
         return FakeAgy(self, cmd)
@@ -178,6 +189,9 @@ class PersistentSessionTests(unittest.TestCase):
             patch("session.register_tracked_process"),
             patch("session.terminate_process", side_effect=lambda p: p.kill()),
             patch("session.subprocess.Popen", side_effect=self.world.popen),
+            # A fresh model catalog: no test spawns ``agy models`` (through
+            # the patched Popen) depending on which test filled the cache.
+            patch.object(models, "_catalog_cache", (float("inf"), {})),
         ]
         for p in patches:
             p.start()
@@ -461,14 +475,16 @@ class PersistentSessionTests(unittest.TestCase):
         self.world.replies = ["the answer"]
         completion = self._create(client, self._seeded_history())
         self.assertEqual(completion.choices[0].message.content, "the answer")
-        proc = self.world.procs[0]
-        self.assertEqual(len(self.world.procs), 1)
+        proc = self.world.workers[0]
+        self.assertEqual(len(self.world.workers), 1)
         self.assertGreater(len(proc.received), 2)
         self.assertEqual(self._record().get("seed_failures"), 0)
 
     def test_rejected_seed_falls_back_to_one_packed_message(self):
-        for name, setup in (("native tool", lambda w: setattr(w, "seed_tool", True)),
-                            ("status", lambda w: setattr(w, "seed_status", "ERROR"))):
+        # Only a native-tool rejection counts towards single-message rebuilds;
+        # a failed status is transient.
+        for name, setup, counted in (("native tool", lambda w: setattr(w, "seed_tool", True), 1),
+                                     ("status", lambda w: setattr(w, "seed_status", "ERROR"), 0)):
             with self.subTest(name):
                 session._REGISTRY.clear()
                 self.world.procs.clear()
@@ -480,7 +496,7 @@ class PersistentSessionTests(unittest.TestCase):
                 with self.assertLogs("session", level="WARNING") as logs:
                     completion = self._create(client, self._seeded_history())
                 self.assertEqual(completion.choices[0].message.content, "the answer")
-                first, second = self.world.procs
+                first, second = self.world.workers
                 self.assertEqual(first.returncode, -9)
                 self.assertEqual(len(first.received), 1, "the real turn never reached the seeded run")
                 conv_dir = self.store.gemini_dir / "conversations"
@@ -693,7 +709,7 @@ class PersistentSessionTests(unittest.TestCase):
                 time.sleep(0.05)
             self.assertTrue(acquired, "the abandoned turn released its lock")
             lock.release()
-        self.assertEqual(self.world.procs[0].returncode, -9)
+        self.assertEqual(self.world.workers[0].returncode, -9)
         del stream
         record = self._record()
         self.assertTrue(record is None or record["needs_refresh"])

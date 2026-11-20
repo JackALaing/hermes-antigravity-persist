@@ -152,6 +152,11 @@ class WorkerTurnUsageTests(unittest.TestCase):
         patcher_token = patch("process.resolve_real_token_path", return_value=None)
         patcher_cmd = patch("client.resolve_agy_command", return_value="agy")
         patcher_keychains = patch("process._link_macos_keychains")
+        # A fresh model catalog, so no test's patched Popen is consumed by an
+        # ``agy models`` lookup depending on which test filled the cache.
+        patcher_catalog = patch("models._catalog_cache", (float("inf"), {}))
+        patcher_catalog.start()
+        self.addCleanup(patcher_catalog.stop)
         patcher_auth.start()
         patcher_token.start()
         patcher_cmd.start()
