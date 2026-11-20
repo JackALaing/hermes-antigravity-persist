@@ -22,6 +22,7 @@ if str(plugin_dir) not in sys.path:
 
 import persist  # noqa: E402
 import session  # noqa: E402
+import stream as stream_mod  # noqa: E402
 from client import AntigravityClient  # noqa: E402
 from persist import PersistStore, scope_key  # noqa: E402
 
@@ -249,6 +250,42 @@ class PersistentSessionTests(unittest.TestCase):
         # Second message on the resumed conversation: this step's context
         # (which includes the planted turn), not a per-process counter.
         self.assertEqual((usage.prompt_tokens, usage.completion_tokens), (200 + 2000, 7))
+
+    def test_turns_log_refresh_then_resume_with_cache_hit_and_gap(self):
+        client = self._client()
+        with self.assertLogs(level="INFO") as logs:
+            self._two_turns(client)
+        lines = [r.getMessage() for r in logs.records
+                 if r.getMessage().startswith("Antigravity turn cache:")]
+        self.assertEqual(len(lines), 2)
+        fields = [dict(p.split("=", 1) for p in line.split(": ", 1)[1].split()) for line in lines]
+        self.assertEqual([f["kind"] for f in fields], ["refresh", "resume"])
+        self.assertEqual({f["conv"] for f in fields}, {f"persist:{self.key}"[:20]})
+        # The fake agy's second message: input 200, cache reads 2000.
+        self.assertEqual((fields[1]["input"], fields[1]["cache_read"], fields[1]["hit"]),
+                         ("200", "2000", "90.9%"))
+        self.assertTrue(fields[1]["gap"].endswith("s"))
+
+    def test_resume_in_a_new_process_takes_the_gap_from_the_record(self):
+        client = self._client()
+        m1 = [{"role": "user", "content": "plant"}]
+        c1 = self._create(client, m1)
+        record = self._record()
+        assert record is not None
+        record["updated_at"] -= 95.0  # the previous turn ended 95s ago
+        self.store.save(record)
+        self.world.procs[0].kill()
+        session._REGISTRY.clear()
+        stream_mod._TURN_ENDS.clear()  # as in a fresh Hermes process
+        m2 = m1 + [self._reply(c1), {"role": "user", "content": "recall"}]
+        with self.assertLogs(level="INFO") as logs:
+            self._create(self._client(), m2)
+        line = [r.getMessage() for r in logs.records
+                if r.getMessage().startswith("Antigravity turn cache:")][-1]
+        self.assertIn("kind=resume", line)
+        gap = float(line.split("gap=", 1)[1].split("s", 1)[0])
+        self.assertGreaterEqual(gap, 95.0)
+        self.assertLess(gap, 120.0)
 
     def test_resume_rejected_when_conversation_not_found_refreshes(self):
         client = self._client()

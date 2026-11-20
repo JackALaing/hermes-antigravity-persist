@@ -111,14 +111,19 @@ class _StepUsage:
     these values never accumulate across turns of a persistent process.
     """
 
-    __slots__ = ("seen", "last_input", "last_cache_read", "output_sum", "first_context")
+    __slots__ = ("seen", "count", "last_input", "last_cache_read", "output_sum", "first_input",
+                 "first_cache_read", "input_sum", "cache_read_sum")
 
     def __init__(self) -> None:
         self.seen = False
+        self.count = 0
         self.last_input = 0
         self.last_cache_read = 0
         self.output_sum = 0
-        self.first_context = 0
+        self.first_input = 0
+        self.first_cache_read = 0
+        self.input_sum = 0
+        self.cache_read_sum = 0
 
     def add(self, usage: Any) -> None:
         if not isinstance(usage, dict):
@@ -126,11 +131,19 @@ class _StepUsage:
         input_tokens = int(usage.get("input_tokens") or 0)
         cache_read = int(usage.get("cache_read_tokens") or 0)
         if not self.seen:
-            self.first_context = input_tokens + cache_read
+            self.first_input = input_tokens
+            self.first_cache_read = cache_read
         self.seen = True
+        self.count += 1
         self.last_input = input_tokens
         self.last_cache_read = cache_read
+        self.input_sum += input_tokens
+        self.cache_read_sum += cache_read
         self.output_sum += int(usage.get("output_tokens") or 0)
+
+    @property
+    def first_context(self) -> int:
+        return self.first_input + self.first_cache_read
 
     @property
     def context_tokens(self) -> int:
@@ -210,6 +223,62 @@ def _delta_worker_usage(usage_data: dict[str, Any], baseline: dict[str, int]) ->
     )
 
 
+def cache_hit_pct(input_tokens: int, cache_read: int) -> float:
+    """Share of the prompt served from cache; agy's input_tokens excludes cache reads."""
+    total = input_tokens + cache_read
+    return 100.0 * cache_read / total if total > 0 else 0.0
+
+
+# Wall-clock end of the last turn per conversation key, for the per-turn cache
+# log: Gemini's implicit cache is reported to decay with idle time, so each
+# turn logs how long its conversation sat idle before it. In-process only and
+# bounded; the oldest key is dropped first.
+_TURN_ENDS: dict[str, float] = {}
+_TURN_ENDS_LOCK = threading.Lock()
+_TURN_ENDS_MAX = 512
+
+
+def _turn_gap(key: str, sent_at: float, ended_at: float, previous_hint: float | None) -> float | None:
+    """Seconds from the previous turn's end to this turn's send, then record this end.
+
+    ``previous_hint`` is a persisted end time (a persistent record's
+    ``updated_at``) covering turns another process or an earlier run served;
+    the later of it and the in-process value wins.
+    """
+    with _TURN_ENDS_LOCK:
+        previous = _TURN_ENDS.pop(key, None)
+        _TURN_ENDS[key] = ended_at
+        while len(_TURN_ENDS) > _TURN_ENDS_MAX:
+            del _TURN_ENDS[next(iter(_TURN_ENDS))]
+    if previous_hint is not None:
+        previous = previous_hint if previous is None else max(previous, previous_hint)
+    if previous is None:
+        return None
+    return max(sent_at - previous, 0.0)
+
+
+def log_turn_cache(step_usage: _StepUsage, *, kind: str, conversation_key: str, gap: float | None,
+                   agy_conversation: str = "", fallback: tuple[int, int] = (0, 0)) -> None:
+    """One INFO line per turn: cache reads, hit %, idle gap and how the turn was sent.
+
+    The first step is the one sent after the idle gap, so its numbers lead;
+    multi-step turns add the whole turn's totals. ``fallback`` is (input,
+    cache_read) for a turn whose steps carried no usage.
+    """
+    if step_usage.seen:
+        input_tokens, cache_read = step_usage.first_input, step_usage.first_cache_read
+    else:
+        input_tokens, cache_read = fallback
+    line = (f"Antigravity turn cache: kind={kind or 'unknown'} conv={conversation_key[:20] or '-'} "
+            f"agy={agy_conversation[:8] or '-'} input={input_tokens} cache_read={cache_read} "
+            f"hit={cache_hit_pct(input_tokens, cache_read):.1f}% "
+            f"gap={'n/a' if gap is None else f'{gap:.1f}s'} steps={step_usage.count}")
+    if step_usage.count > 1:
+        line += (f" turn_input={step_usage.input_sum} turn_cache_read={step_usage.cache_read_sum} "
+                 f"turn_hit={cache_hit_pct(step_usage.input_sum, step_usage.cache_read_sum):.1f}%")
+    logger.info(line)
+
+
 async def _ready(value: Any) -> Any:
     """Trivial coroutine that immediately returns *value*.
 
@@ -266,6 +335,9 @@ class AntigravityStream(Iterator[Any]):
         delivery_watch: Any = None,
         delivery_sample_key: str = "",
         pending_lines: list[str] | None = None,
+        turn_kind: str = "",
+        conversation_key: str = "",
+        previous_turn_end: float | None = None,
     ):
         # Loud pairing, not a defaulted bool (review nit): a future site
         # passing worker_lock WITHOUT worker_lock_held would silently never
@@ -318,6 +390,15 @@ class AntigravityStream(Iterator[Any]):
         # handshake read while validating a resumed conversation); replayed
         # before any new read so the stream sees the process's whole output.
         self._pending_lines: list[str] = list(pending_lines or [])
+        # Per-turn cache log (see log_turn_cache): how this turn was sent
+        # (resume, refresh, one-shot, worker-delta, worker-full), the
+        # conversation it belongs to for the idle gap (empty: no gap), and
+        # when its prompt went out. Callers build the stream right after the
+        # write, so construction time is the send time.
+        self.turn_kind = turn_kind
+        self.conversation_key = conversation_key
+        self.previous_turn_end = previous_turn_end
+        self.sent_at = time.time()
         # Exactly what this stream hands the host: the reply fingerprint of a
         # persistent conversation is computed from it (see persist.py).
         self.reply_content_parts: list[str] = []
@@ -677,6 +758,18 @@ class AntigravityStream(Iterator[Any]):
         else:
             prompt_tokens, completion_tokens, cached_tokens = fallback
         return prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, cached_tokens
+
+    def _log_turn_cache(self, prompt_tokens: int, cached_tokens: int) -> None:
+        """Log this turn's cache line; diagnostics must never fail the turn."""
+        try:
+            gap = None
+            if self.conversation_key:
+                gap = _turn_gap(self.conversation_key, self.sent_at, time.time(), self.previous_turn_end)
+            log_turn_cache(self.step_usage, kind=self.turn_kind, conversation_key=self.conversation_key,
+                           gap=gap, agy_conversation=self.conversation_id or "",
+                           fallback=(max(prompt_tokens - cached_tokens, 0), cached_tokens))
+        except Exception:
+            logger.debug("Per-turn cache log failed", exc_info=True)
 
     def reply_message(self) -> dict[str, Any]:
         """The assistant message this stream delivered, in Hermes' shape."""
@@ -1303,6 +1396,7 @@ class AntigravityStream(Iterator[Any]):
             # absorbs them. There is no yield between this computation and
             # the finish-reason yield, so chunk emission order is unchanged.
             input_tokens, output_tokens, total_tokens, cached_tokens = self._usage_totals(usage_data)
+            self._log_turn_cache(input_tokens, cached_tokens)
 
             # Heuristic only (issue #29), restricted to comparable full sends.
             # Include cache reads conservatively; never change reported usage.

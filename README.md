@@ -73,6 +73,15 @@ loops. Changes in text density can still cause false positives. This warning doe
 not prevent or repair the upstream tail truncation tracked in
 [issue 29](https://github.com/soyelmismo/hermes-antigravity-subscription/issues/29).
 Split large single-shot inputs or use a provider that delivers them intact.
+
+Every completed turn logs one INFO line, `Antigravity turn cache:`, with how it
+was sent (`resume`, `refresh`, `one-shot`, `worker-delta`, `worker-full`), the
+first model step's `input` and `cache_read` tokens, the hit rate
+`cache_read / (input + cache_read)` (agy's `input_tokens` excludes cache reads),
+the seconds since the conversation's previous turn ended (`gap`, from the
+persistent record across processes, `n/a` when unknown), and the step count with
+whole-turn totals when a turn has several steps. Context-only refresh parts log
+their own totals in the restore line.
 Reasoning text in `stream-json` remains blocked upstream: `agy` exposes no flag for it
 ([issue 31](https://github.com/soyelmismo/hermes-antigravity-subscription/issues/31)).
 

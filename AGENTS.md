@@ -13,7 +13,7 @@ This repository implements the `antigravity-subscription-directsdk` provider plu
 - [`client.py`](client.py): Manages persistent worker lifecycle, per-turn delta reuse, thread locks (`_lock`, `_worker_lock`), isolated HOME configuration, and cleanup retry budgets.
 - [`prompt.py`](prompt.py): Assembles prompts from Hermes messages, prunes historical tool outputs to avoid Go channel backpressure, formats delta prompts, and translates `<tool_call>` blocks.
 - [`process.py`](process.py): Detects the `agy` binary, reads OS keyring tokens (Linux, macOS, Windows), creates isolated HOME symlinks, terminates process trees, and spawns console-subsystem children with `CREATE_NO_WINDOW` on Windows.
-- [`stream.py`](stream.py): Parses streaming JSON events from `agy`, emits token chunks, detects native tool abort signals, tracks per-turn usage deltas, and reports why a turn ended without a `result` event (`stream deadline` or `stdout closed`, elapsed time, age of the last stdout line).
+- [`stream.py`](stream.py): Parses streaming JSON events from `agy`, emits token chunks, detects native tool abort signals, tracks per-turn usage deltas, logs one cache line per completed turn (kind, cache hit %, idle gap), and reports why a turn ended without a `result` event (`stream deadline` or `stdout closed`, elapsed time, age of the last stdout line).
 - [`plugin.yaml`](plugin.yaml): Plugin manifest for Hermes Agent and the catalog registry.
 
 ---

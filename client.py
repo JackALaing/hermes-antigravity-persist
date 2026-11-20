@@ -955,6 +955,13 @@ class AntigravityClient:
             self._arm_idle_timer_locked()
             return proc
 
+    def _cache_log_key(self) -> str:
+        """Groups this client's worker turns in the per-turn cache log."""
+        key = getattr(self, "_cache_log_key_value", None)
+        if key is None:
+            key = self._cache_log_key_value = f"worker:{os.urandom(6).hex()}"
+        return key
+
     def _run_oneshot_completion(
         self,
         *,
@@ -1032,6 +1039,7 @@ class AntigravityClient:
             # Oneshots run concurrently when the worker is busy. They have no
             # comparable prior sample and must not mutate the worker watch.
             delivery_watch=None,
+            turn_kind="one-shot",
         )
         if stream:
             return stream_iter
@@ -1146,6 +1154,7 @@ class AntigravityClient:
                         is_continuation = False
 
                 comparable_full_send = not is_continuation
+                turn_kind = "worker-delta" if is_continuation else "worker-full"
                 if is_continuation:
                     proc = self._get_or_spawn_worker(
                         resolved_model, effort, conversation_id=conv_id_to_resume
@@ -1185,6 +1194,7 @@ class AntigravityClient:
                 except (BrokenPipeError, OSError):
                     self._raise_if_cancelled()
                     comparable_full_send = True
+                    turn_kind = "worker-full"
                     with self._lock:
                         self._terminate_worker_locked(keep_conversation=False)
                         self._purge_isolated_conversations()
@@ -1224,6 +1234,8 @@ class AntigravityClient:
                     prompt_chars=len(prompt_payload),
                     delivery_watch=self._delivery_watch if comparable_full_send else None,
                     delivery_sample_key=f"{resolved_model}:{effort}",
+                    turn_kind=turn_kind,
+                    conversation_key=self._cache_log_key(),
                 )
                 if stream:
                     return stream_iter
@@ -1277,6 +1289,8 @@ class AntigravityClient:
                         prompt_chars=len(prompt_payload),
                         delivery_watch=self._delivery_watch if comparable_full_send else None,
                         delivery_sample_key=f"{resolved_model}:{effort}",
+                        turn_kind=turn_kind,
+                        conversation_key=self._cache_log_key(),
                     )
                 try:
                     self._raise_if_cancelled()

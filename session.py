@@ -58,7 +58,7 @@ try:
     )
     from .models import split_effort_suffix
     from .prompt import _latest_user_text
-    from .stream import AntigravityStream, _StepUsage, _delta_worker_usage
+    from .stream import AntigravityStream, _StepUsage, _delta_worker_usage, cache_hit_pct
 except ImportError:
     import persist
     from persist import (
@@ -85,13 +85,22 @@ except ImportError:
     )
     from models import split_effort_suffix
     from prompt import _latest_user_text
-    from stream import AntigravityStream, _StepUsage, _delta_worker_usage
+    from stream import AntigravityStream, _StepUsage, _delta_worker_usage, cache_hit_pct
 
 logger = logging.getLogger(__name__)
 
 
 def _base_model(model: str) -> str:
     return split_effort_suffix(model)[0]
+
+
+def _record_time(record: dict[str, Any] | None) -> float | None:
+    """The record's last commit time: when its conversation's previous turn ended."""
+    try:
+        value = float((record or {}).get("updated_at"))
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
 
 
 class ResumeRejected(Exception):
@@ -461,7 +470,9 @@ class PersistentTurn:
                               native_tool=native_tool)
         if failure:
             raise RuntimeError(f"Antigravity execution failed: context restore was not acknowledged ({failure})")
-        logger.info("Antigravity context restore acknowledged (%d tokens)", tokens)
+        logger.info("Antigravity context restore acknowledged (%d tokens; input=%d cache_read=%d hit=%.1f%%)",
+                    tokens, steps.input_sum, steps.cache_read_sum,
+                    cache_hit_pct(steps.input_sum, steps.cache_read_sum))
 
 
 def run_persistent_turn(
@@ -572,4 +583,7 @@ def _start_turn(turn: PersistentTurn, store: PersistStore, key: str, record: dic
         prompt_chars=len(payloads[-1]),
         delivery_watch=None,
         pending_lines=pending,
+        turn_kind="resume" if decision.resume else "refresh",
+        conversation_key=f"persist:{key}",
+        previous_turn_end=_record_time(record),
     )
