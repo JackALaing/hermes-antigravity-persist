@@ -338,17 +338,39 @@ class PersistStore:
                 if path.suffix != ".json":
                     continue
                 record = self.load(path.stem) or {}
-                if age <= RECORD_MAX_AGE_SECONDS:
+                if age <= RECORD_MAX_AGE_SECONDS or not self._expire_record(path, now):
                     live_keys.add(path.stem)
                     if record.get("agy_conversation_id"):
                         live_ids.add(str(record["agy_conversation_id"]))
                     continue
-                self.delete_conversation(record.get("agy_conversation_id"))
-                with contextlib.suppress(OSError):
-                    path.unlink()
-                    removed += 1
+                removed += 1
         self._gc_orphans(now, live_ids, live_keys)
         return removed
+
+    def _expire_record(self, path: Path, now: float) -> bool:
+        """Delete an idle record and its conversation under its lock.
+
+        False (kept) when a turn holds the lock or the record was written
+        again meanwhile: that turn is resuming or replacing it right now.
+        """
+        lock = ConversationLock(self.lock_path(path.stem))
+        try:
+            if not lock.acquire(0):
+                return False
+        except OSError:
+            return False
+        try:
+            age = _age(path, now)
+            if age is None or age <= RECORD_MAX_AGE_SECONDS:
+                return False
+            record = self.load(path.stem) or {}
+            self.delete_conversation(record.get("agy_conversation_id"))
+            path.unlink()
+            return True
+        except OSError:
+            return False
+        finally:
+            lock.release()
 
     def _gc_orphans(self, now: float, live_ids: set[str], live_keys: set[str]) -> None:
         def expire(directory: Path, pattern: str, max_age: float) -> None:
@@ -412,16 +434,29 @@ class ConversationLock:
         while True:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                self._fd = fd
-                return True
             except BlockingIOError:
                 if time.monotonic() >= deadline:
                     os.close(fd)
                     return False
                 time.sleep(0.05)
+                continue
             except OSError:
                 os.close(fd)
                 raise
+            if self._still_linked(fd):
+                self._fd = fd
+                return True
+            # The file was unlinked (orphan-lock cleanup) while we waited on
+            # it: a lock on it excludes nobody. Lock the current file instead.
+            os.close(fd)
+            fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+
+    def _still_linked(self, fd: int) -> bool:
+        try:
+            held, current = os.fstat(fd), os.stat(self.path)
+        except OSError:
+            return False
+        return (held.st_dev, held.st_ino) == (current.st_dev, current.st_ino)
 
     def locked(self) -> bool:
         return self._fd is not None

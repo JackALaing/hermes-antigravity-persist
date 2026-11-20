@@ -635,6 +635,24 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(len(record["pad"]), 400000)
 
 
+    def test_gc_keeps_an_old_record_whose_lock_is_held(self):
+        conv_dir = self.store.gemini_dir / "conversations"
+        conv_dir.mkdir(parents=True)
+        (conv_dir / "busy-conv.db").write_text("x")
+        self.store.save(_record(REPLY, scope_hash="busy", agy_conversation_id="busy-conv"))
+        past = time.time() - persist.RECORD_MAX_AGE_SECONDS - 10
+        os.utime(self.store.record_path("busy"), (past, past))
+        holder = ConversationLock(self.store.lock_path("busy"))
+        self.assertTrue(holder.acquire(0))
+        try:
+            self.assertEqual(self.store.gc(), 0)
+        finally:
+            holder.release()
+        self.assertIsNotNone(self.store.load("busy"))
+        self.assertTrue((conv_dir / "busy-conv.db").exists())
+        self.assertEqual(self.store.gc(), 1, "collected once nobody holds it")
+
+
 class LockTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -689,6 +707,30 @@ class LockTests(unittest.TestCase):
         first.release()
         self.assertTrue(second.acquire(0.1))
         second.release()
+
+
+    def test_a_lock_on_an_unlinked_file_is_not_kept(self):
+        # Orphan-lock cleanup may unlink the file a waiter has open; the
+        # waiter must then lock the current file, or a newcomer that creates
+        # a fresh file holds the "same" lock at the same time.
+        import threading
+
+        holder = ConversationLock(self.path)
+        self.assertTrue(holder.acquire(0))
+        waiter = ConversationLock(self.path)
+        got = []
+        thread = threading.Thread(target=lambda: got.append(waiter.acquire(5)))
+        thread.start()
+        time.sleep(0.2)
+        self.path.unlink()
+        holder.release()
+        thread.join(5)
+        self.assertEqual(got, [True])
+        newcomer = ConversationLock(self.path)
+        self.assertFalse(newcomer.acquire(0.1), "the waiter holds the file now at the path")
+        waiter.release()
+        self.assertTrue(newcomer.acquire(0.1))
+        newcomer.release()
 
 
 if __name__ == "__main__":
