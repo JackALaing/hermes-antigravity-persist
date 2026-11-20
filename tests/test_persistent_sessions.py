@@ -269,9 +269,12 @@ class PersistentSessionTests(unittest.TestCase):
         self.assertEqual(len(second.received), 1)
         self.assertIn("recall it", second.received[0])
         usage = c2.usage
-        # Second message on the resumed conversation: this step's context
-        # (which includes the planted turn), not a per-process counter.
-        self.assertEqual((usage.prompt_tokens, usage.completion_tokens), (200 + 2000, 7))
+        # Hermes is told the size of its own request; agy's conversation size
+        # (this step's context, which includes the planted turn, not a
+        # per-process counter) stays in the record for the refresh decision.
+        self.assertEqual((usage.prompt_tokens, usage.completion_tokens),
+                         (persist.hermes_request_tokens(m2, TOOLS, None), 7))
+        self.assertEqual(self._record()["agy_size_tokens"], 200 + 2000)
 
     def test_turns_log_refresh_then_resume_with_cache_hit_and_gap(self):
         client = self._client()
@@ -415,9 +418,11 @@ class PersistentSessionTests(unittest.TestCase):
         self.assertIn("a119 ", joined)
         record = self._record()
         self.assertGreater(record["seed_tokens_total"], 0)
-        # Usage is the real turn's step usage only (n-th message on this conversation).
+        # agy's size is the real turn's step usage only (n-th message on this
+        # conversation); Hermes is told the size of its own request.
         usage = [c for c in chunks if getattr(c, "usage", None)][-1].usage
-        self.assertEqual(usage.prompt_tokens, 100 * n + 1000 * n)
+        self.assertEqual(record["agy_size_tokens"], 100 * n + 1000 * n)
+        self.assertEqual(usage.prompt_tokens, persist.hermes_request_tokens(history, TOOLS, None))
         self.assertEqual(usage.completion_tokens, 7)
 
     def test_each_seed_and_the_real_turn_get_the_full_timeout(self):
@@ -452,12 +457,14 @@ class PersistentSessionTests(unittest.TestCase):
             history += [{"role": "user", "content": f"u{i} " + "x" * 3000},
                         {"role": "assistant", "content": f"a{i} " + "x" * 3000}]
         history.append({"role": "user", "content": "FINAL"})
-        completion = self._create(client, history)
+        with self.assertLogs("stream", level="INFO") as logs:
+            completion = self._create(client, history)
         n = len(self.world.procs[0].received)
         self.assertGreater(n, 2)
         # result.usage after the turn is cumulative over every seed and the
-        # turn; only the real turn's increment is reported.
-        self.assertEqual(completion.usage.prompt_tokens, 100 * n + 1000 * n)
+        # turn; only the real turn's increment is measured.
+        line = [m for m in logs.output if "Antigravity turn cache:" in m][-1]
+        self.assertIn(f"input={100 * n} cache_read={1000 * n} ", line)
         self.assertEqual(completion.usage.completion_tokens, 7)
 
     @staticmethod
@@ -508,7 +515,8 @@ class PersistentSessionTests(unittest.TestCase):
                 self.assertLess(persist.utf8_len(second.received[0]), persist.MAX_STDIN_BYTES)
                 record = self._record()
                 self.assertEqual(record["agy_conversation_id"], second.conversation)
-                self.assertEqual(record["seed_failures"], 1)
+                self.assertEqual(record["seed_failures"], counted)
+                self.assertEqual(record["seed_tokens_total"], 0, "the discarded seeds are not counted")
                 text = "\n".join(logs.output)
                 self.assertIn("rebuilding as a single message", text)
                 self.assertNotIn("Acknowledged", text)
@@ -801,6 +809,132 @@ class PersistentSessionTests(unittest.TestCase):
         with patch("client.run_persistent_turn", side_effect=RuntimeError("other")):
             with self.assertRaisesRegex(RuntimeError, "other"):
                 self._create(client, [{"role": "user", "content": "q"}], stream=True)
+
+    # -- Hermes-side size (review B2) ----------------------------------------
+    def _agy_size(self, tokens):
+        self.world.real_usage = {"input_tokens": 1_000, "output_tokens": 7,
+                                 "cache_read_tokens": tokens - 1_000}
+
+    def test_hermes_compaction_sees_its_own_size_and_agy_keeps_its_conversation(self):
+        """The reviewer's h525_probe_compaction scenario, through Hermes' own breaker.
+
+        Neon compacts at 15% of 1M. Hermes' history crosses it, Hermes
+        compacts, and agy's live conversation (160K, then 170K) is left as it
+        is: the next turn resumes it, and what Hermes is told is the size of
+        its own compacted request, so the compaction counts as effective.
+        """
+        try:
+            from agent.context_compressor import ContextCompressor
+        except Exception as exc:  # pragma: no cover - outside a Hermes checkout
+            self.skipTest(f"Hermes ContextCompressor unavailable: {exc}")
+
+        def compressor():
+            with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
+                return ContextCompressor(model="gemini-4-neon", threshold_percent=0.15, quiet_mode=True)
+
+        cc = compressor()
+        threshold = cc.threshold_tokens
+        self.assertTrue(140_000 <= threshold <= 160_000, threshold)  # ~15% of a 1M window
+        system = {"role": "system", "content": "SOUL...\nModel: gemini-4-neon\nProvider: antigravity"}
+        m1 = [system]
+        for i in range(45):  # ~4K estimated tokens per exchange
+            m1 += [{"role": "user", "content": f"question {i} " + "w " * 8000},
+                   {"role": "assistant", "content": f"answer {i}"}]
+        m1.append({"role": "user", "content": "plant the fact"})
+        client = self._client()
+        self._agy_size(160_000)
+        c1 = self._create(client, m1)
+        self.assertGreaterEqual(c1.usage.prompt_tokens, threshold, "Hermes' own history is over its trigger")
+        cc.update_from_response({"prompt_tokens": c1.usage.prompt_tokens,
+                                 "completion_tokens": c1.usage.completion_tokens})
+        self.assertTrue(cc.should_compress())
+
+        # Hermes compacts: system prompt, its handoff summary, the protected
+        # tail. The system prompt bytes are unchanged, as Hermes rebuilds them.
+        summary = {"role": "user", "content": "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were "
+                   "compacted ...\n--- END OF CONTEXT SUMMARY — respond to the message below, not the "
+                   "summary above ---"}
+        m2 = [system, summary, *m1[-3:], self._reply(c1), {"role": "user", "content": "next question"}]
+        cc.record_completed_compaction()
+        self._agy_size(170_000)
+        c2 = self._create(client, m2)
+
+        worker = self.world.workers[0]
+        self.assertEqual(len(self.world.workers), 1, "no refresh on compaction: the live worker resumes")
+        self.assertIn("next question", worker.received[-1])
+        self.assertNotIn("question 0 ", worker.received[-1])
+        self.assertEqual(self._record()["agy_size_tokens"], 170_000, "agy's size stays internal")
+        self.assertLess(c2.usage.prompt_tokens, threshold)
+        self.assertEqual(c2.usage.prompt_tokens, persist.hermes_request_tokens(m2, TOOLS, None))
+        self.assertLessEqual(c2.usage.prompt_tokens_details.cached_tokens, c2.usage.prompt_tokens)
+        cc.update_from_response({"prompt_tokens": c2.usage.prompt_tokens,
+                                 "completion_tokens": c2.usage.completion_tokens})
+        self.assertEqual(cc._ineffective_compression_count, 0, "the compaction counts as effective")
+        self.assertFalse(cc.should_compress())
+
+        # What agy's size would have done in Hermes' place (the old report).
+        old = compressor()
+        old.record_completed_compaction()
+        old.update_from_response({"prompt_tokens": self._record()["agy_size_tokens"]})
+        self.assertEqual(old._ineffective_compression_count, 1)
+
+    def test_refresh_at_the_size_threshold_rebuilds_compacted_history_in_full(self):
+        client = self._client()
+        system = {"role": "system", "content": "SYS"}
+        summary = {"role": "user", "content": "[CONTEXT COMPACTION — REFERENCE ONLY] SUMMARY-FACT"}
+        m1 = [system, summary, {"role": "assistant", "content": "ok"}]
+        for i in range(30):
+            m1 += [{"role": "user", "content": f"note {i} " + "z " * 4000},
+                   {"role": "assistant", "content": f"seen {i}"}]
+        m1.append({"role": "user", "content": "q"})
+        self._agy_size(persist.REFRESH_SIZE_TOKENS + 1)
+        c1 = self._create(client, m1)
+        self.assertLess(c1.usage.prompt_tokens, persist.REFRESH_MAX_TOKENS)
+        self.world.real_usage = None
+        m2 = m1 + [self._reply(c1), {"role": "user", "content": "next"}]
+        self._create(client, m2)
+        fresh = self.world.workers[-1]
+        self.assertEqual(len(self.world.workers), 2)
+        self.assertNotIn("--conversation", fresh.cmd)
+        joined = "\n".join(fresh.received)
+        self.assertIn("SUMMARY-FACT", joined)
+        self.assertIn("note 0 ", joined, "Hermes' compacted history fits the rebuild whole")
+        self.assertNotIn("earlier messages omitted", joined)
+
+    # -- seed failures (review S2) -----------------------------------------
+    def test_accepted_seeds_reset_the_failure_count(self):
+        client = self._client()
+        self._create(client, [{"role": "user", "content": "q"}])
+        record = self._record()
+        record.update(seed_failures=1, seed_failure_at=time.time(), needs_refresh=True)
+        self.store.save(record)
+        self._create(client, self._seeded_history())
+        self.assertGreater(len(self.world.workers[-1].received), 1, "a seeded rebuild")
+        record = self._record()
+        self.assertEqual(record["seed_failures"], 0)
+        self.assertIsNone(record["seed_failure_at"])
+
+    def test_single_message_rebuilds_lapse_after_the_ttl(self):
+        client = self._client()
+        self._create(client, [{"role": "user", "content": "q"}])
+        record = self._record()
+        record.update(seed_failures=session.SEED_FAILURE_LIMIT, needs_refresh=True,
+                      seed_failure_at=time.time() - session.SEED_FAILURE_TTL_SECONDS - 60)
+        self.store.save(record)
+        self._create(client, self._seeded_history())
+        refreshed = self.world.workers[-1]
+        self.assertGreater(len(refreshed.received), 1)
+        self.assertTrue(refreshed.received[0].startswith("[CONTEXT ONLY"))
+        self.assertEqual(self._record()["seed_failures"], 0)
+
+    def test_failing_housekeeping_does_not_fail_the_turn(self):
+        client = self._client()
+        with patch.object(PersistStore, "gc", side_effect=OSError("disk full")), \
+                self.assertLogs("session", level="WARNING") as logs:
+            completion = self._create(client, [{"role": "user", "content": "q"}])
+        self.assertTrue(completion.choices[0].message.content)
+        self.assertFalse(self._record()["needs_refresh"])
+        self.assertIn("cleanup failed", "\n".join(logs.output))
 
 
 class KwargsForwardingTests(unittest.TestCase):

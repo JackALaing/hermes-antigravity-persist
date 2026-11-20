@@ -343,6 +343,7 @@ class AntigravityStream(Iterator[Any]):
         turn_kind: str = "",
         conversation_key: str = "",
         previous_turn_end: float | None = None,
+        reported_prompt_tokens: int | None = None,
     ):
         # Loud pairing, not a defaulted bool (review nit): a future site
         # passing worker_lock WITHOUT worker_lock_held would silently never
@@ -404,6 +405,11 @@ class AntigravityStream(Iterator[Any]):
         self.conversation_key = conversation_key
         self.previous_turn_end = previous_turn_end
         self.sent_at = time.time()
+        # Persistent turns: the size of Hermes' own request (persist.
+        # hermes_request_tokens), reported as prompt_tokens in place of agy's
+        # accumulated conversation so Hermes' compaction measures its own
+        # history. agy's size stays internal (the record and the cache log).
+        self.reported_prompt_tokens = reported_prompt_tokens
         # Exactly what this stream hands the host: the reply fingerprint of a
         # persistent conversation is computed from it (see persist.py).
         self.reply_content_parts: list[str] = []
@@ -777,6 +783,19 @@ class AntigravityStream(Iterator[Any]):
         else:
             prompt_tokens, completion_tokens, cached_tokens = fallback
         return prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, cached_tokens
+
+    def _reported_prompt(self, prompt_tokens: int, cached_tokens: int) -> tuple[int, int]:
+        """(prompt, cached) as reported to Hermes.
+
+        Without ``reported_prompt_tokens`` agy's own counts. With it, that
+        size, and cache reads scaled to agy's hit ratio so the cached part
+        never exceeds the prompt Hermes prices.
+        """
+        reported = self.reported_prompt_tokens
+        if reported is None or reported <= 0:
+            return prompt_tokens, cached_tokens
+        ratio = min(cached_tokens / prompt_tokens, 1.0) if prompt_tokens > 0 else 0.0
+        return reported, int(round(reported * ratio))
 
     def _log_turn_cache(self, prompt_tokens: int, cached_tokens: int) -> None:
         """Log this turn's cache line; diagnostics must never fail the turn."""
@@ -1426,6 +1445,10 @@ class AntigravityStream(Iterator[Any]):
                     self.prompt_chars, input_tokens,
                     sample_key=self.delivery_sample_key,
                 )
+            # What Hermes sees (see _reported_prompt); computed before the
+            # finish chunk like the rest of the usage.
+            input_tokens, cached_tokens = self._reported_prompt(input_tokens, cached_tokens)
+            total_tokens = input_tokens + output_tokens
 
             # A persistent conversation commits its record and releases its
             # cross-process lock here, before the finish chunk: a consumer

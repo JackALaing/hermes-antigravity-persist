@@ -74,7 +74,12 @@ RECORD_VERSION = 1
 # and delegated agents carry no (or their own) cache scope.
 PERSISTENT_ORIGIN = "assistant_tool"
 # Refresh before agy's own conversation grows past this (last step's input
-# plus cache read). Hermes' compaction threshold on these profiles is higher.
+# plus cache read). Independent of Hermes' compaction: persistent turns report
+# the size of Hermes' own request to Hermes (``hermes_request_tokens``), so
+# Hermes compacts its history on its own measure while agy's live
+# conversation keeps full detail until it reaches this size. A refresh then
+# rebuilds from Hermes' compacted history, which fits the rebuild cap below
+# as long as Hermes' compaction threshold is BELOW REFRESH_MAX_TOKENS.
 # Override: ANTIGRAVITY_REFRESH_SIZE_TOKENS.
 REFRESH_SIZE_TOKENS = 360_000
 # Estimated size cap of a whole refresh rebuild (every seed plus the final
@@ -631,6 +636,38 @@ def decide(
 # --------------------------------------------------------------------------
 # Packing
 # --------------------------------------------------------------------------
+
+
+def hermes_request_tokens(messages: Sequence[Any], tools: list[dict[str, Any]] | None,
+                          tool_choice: Any) -> int:
+    """Estimated tokens of a fresh send of the whole Hermes request.
+
+    This is the size a persistent turn reports to Hermes as ``prompt_tokens``
+    instead of agy's accumulated conversation, so Hermes' compaction measures
+    its own history: after a compaction the next turn reports the reduced
+    size, while agy's conversation keeps its detail until the refresh
+    threshold. It mirrors the one-message prompt a refresh renders (preamble,
+    tool schemas, system prompt, the transcript with all but the newest tool
+    results cut to a stub) without its cap, but reads text only: rendering
+    would resolve media references (writing data URLs to the cache,
+    downloading remote images) on every turn.
+    """
+    sections = [*_PROMPT_PREAMBLE, *_tool_sections(tools, tool_choice)]
+    history: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if _role(message) == "system":
+            sections.append(_flatten_content(message.get("content")))
+        else:
+            history.append(message)
+    for message in _prune_tool_results(history, TOOL_RETENTION_STEPS[0]):
+        sections.append(_flatten_content(message.get("content")))
+        for call in message.get("tool_calls") or []:
+            if isinstance(call, dict):
+                function = call.get("function") or {}
+                sections.append(f"{function.get('name') or ''} {function.get('arguments') or ''}")
+    return estimate_tokens("\n\n".join(s for s in sections if s))
 
 
 def _split_text_bytes(text: str, size: int) -> list[str]:

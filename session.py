@@ -113,12 +113,41 @@ class ResumeRejected(Exception):
 
 
 class SeedRejected(RuntimeError):
-    """A context-only part was not accepted; rebuild as one message instead."""
+    """A context-only part was not accepted; rebuild as one message instead.
+
+    ``native_tool`` marks a rejection because agy ran a native tool on the
+    part: the model ignored the context-only instruction, which recurs. Other
+    rejections (no result, an agy error, a non-SUCCESS status) are transient
+    and never move a conversation to single-message rebuilds.
+    """
+
+    def __init__(self, message: str, *, native_tool: bool = False):
+        super().__init__(message)
+        self.native_tool = native_tool
 
 
-# After this many rejected context-only parts on one Hermes conversation, its
-# refreshes skip seeds and send one packed message (oldest history omitted).
+# After this many context-only parts rejected for running a native tool on one
+# Hermes conversation, its refreshes skip seeds and send one packed message
+# (oldest history omitted). A rebuild whose seeds are all accepted resets the
+# count, and single-message mode lapses SEED_FAILURE_TTL_SECONDS after the
+# last counted rejection, so seeds are tried again.
 SEED_FAILURE_LIMIT = 2
+SEED_FAILURE_TTL_SECONDS = 7 * 24 * 3600
+
+
+def _single_message_rebuilds(record: dict[str, Any] | None, now: float | None = None) -> bool:
+    """Whether this conversation's refreshes skip context-only parts."""
+    record = record or {}
+    if int(record.get("seed_failures") or 0) < SEED_FAILURE_LIMIT:
+        return False
+    try:
+        last = float(record.get("seed_failure_at") or 0)
+    except (TypeError, ValueError):
+        last = 0.0
+    now = time.time() if now is None else now
+    # A record from before the timestamp existed counts from its last commit.
+    last = last or float(_record_time(record) or 0)
+    return now - last < SEED_FAILURE_TTL_SECONDS
 # A persistent turn whose stream nobody has read for this long is abandoned:
 # its worker is killed and the conversation lock released, so later turns do
 # not wait for garbage collection. A live consumer is either blocked inside a
@@ -295,7 +324,14 @@ class PersistentTurn:
         self._system_hash = system_hash(self._messages)
         self.worker: _Worker | None = None
         self.seed_tokens = 0
+        # This turn's seed outcome: a native-tool rejection (counted towards
+        # single-message rebuilds) or a seeded rebuild fully accepted (resets
+        # the count).
         self.seed_failed = False
+        self.seeds_accepted = False
+        # Hermes-side request size reported as prompt_tokens (see
+        # persist.hermes_request_tokens); kept in the record for diagnostics.
+        self.hermes_tokens: int | None = None
         self.committed = False
         self.finished = False
         # Abandon watchdog (see DEFAULT_ABANDON_SECONDS).
@@ -385,6 +421,13 @@ class PersistentTurn:
             same_conversation = previous.get("agy_conversation_id") == worker.conversation_id
             now = time.time()
             token = os.urandom(8).hex()
+            if self.seed_failed:
+                seed_failures, seed_failure_at = int(previous.get("seed_failures") or 0) + 1, now
+            elif self.seeds_accepted:
+                seed_failures, seed_failure_at = 0, None
+            else:
+                seed_failures = int(previous.get("seed_failures") or 0)
+                seed_failure_at = previous.get("seed_failure_at")
             record = {
                 "version": persist.RECORD_VERSION,
                 "scope_hash": self._key,
@@ -393,11 +436,13 @@ class PersistentTurn:
                 "last_user_fp": user_fingerprint(self._messages, len(self._messages)),
                 "system_hash": self._system_hash,
                 "commit_token": token,
-                "seed_failures": int(previous.get("seed_failures") or 0) + (1 if self.seed_failed else 0),
+                "seed_failures": seed_failures,
+                "seed_failure_at": seed_failure_at,
                 "model": _base_model(self._model),
                 "effort": self._effort,
                 "tools_hash": self._tools_hash,
                 "agy_size_tokens": size,
+                "hermes_size_tokens": self.hermes_tokens,
                 "needs_refresh": False,
                 "seed_tokens_total": (int(previous.get("seed_tokens_total") or 0) if same_conversation else 0)
                 + self.seed_tokens,
@@ -444,6 +489,7 @@ class PersistentTurn:
     def discard_worker(self) -> None:
         """Kill this turn's worker and drop the conversation it started (not recorded)."""
         worker, self.worker = self.worker, None
+        self.seed_tokens = 0  # spent on a conversation that no longer exists
         _kill_worker(self._registry_key, worker)
         previous_id = (self._previous or {}).get("agy_conversation_id")
         if worker is not None and worker.conversation_id and worker.conversation_id != previous_id:
@@ -560,7 +606,8 @@ class PersistentTurn:
         self.seed_tokens += tokens
         failure = ack_failure(saw_result=saw_result, status=status, error=error, native_tool=native_tool)
         if failure:
-            raise SeedRejected(f"Antigravity execution failed: context restore was not acknowledged ({failure})")
+            raise SeedRejected(f"Antigravity execution failed: context restore was not acknowledged ({failure})",
+                               native_tool=native_tool)
         logger.info("Antigravity context restore acknowledged (%d tokens; input=%d cache_read=%d hit=%.1f%%)",
                     tokens, steps.input_sum, steps.cache_read_sum,
                     cache_hit_pct(steps.input_sum, steps.cache_read_sum))
@@ -661,8 +708,11 @@ def _start_turn(turn: PersistentTurn, store: PersistStore, key: str, record: dic
             logger.debug("Resuming persistent agy conversation (%d message(s))", len(decision.delta))
     if not decision.resume:
         logger.info("Refreshing persistent agy conversation: %s", decision.reason)
-        store.gc()
-        single = int((record or {}).get("seed_failures") or 0) >= SEED_FAILURE_LIMIT
+        try:  # housekeeping must never fail the user's turn
+            store.gc()
+        except Exception:
+            logger.warning("Antigravity persistent-state cleanup failed", exc_info=True)
+        single = _single_message_rebuilds(record)
         payloads = pack_refresh(messages, model=model, tools=tools, tool_choice=tool_choice,
                                 media_sink=media_sink, max_messages=1 if single else None)
         turn.spawn(None)
@@ -675,13 +725,14 @@ def _start_turn(turn: PersistentTurn, store: PersistStore, key: str, record: dic
             turn.consume_seed(pending, deadline)
             deadline = time.monotonic() + timeout
             pending = turn.write(payload, deadline)
+        turn.seeds_accepted = not decision.resume and len(payloads) > 1
     except SeedRejected as exc:
         # Never fail the conversation over a context-only part: start again
         # from one packed message (the newest history that fits, with the
         # prefix and any compaction summary).
         logger.warning("%s; rebuilding as a single message", exc)
         turn.discard_worker()
-        turn.seed_failed = True
+        turn.seed_failed = exc.native_tool
         decision = persist.Decision(False, "context restore rejected")
         payloads = pack_refresh(messages, model=model, tools=tools, tool_choice=tool_choice,
                                 media_sink=media_sink, max_messages=1)
@@ -689,6 +740,10 @@ def _start_turn(turn: PersistentTurn, store: PersistStore, key: str, record: dic
         turn.spawn(None)
         pending = turn.write(payloads[0], deadline)
 
+    try:
+        turn.hermes_tokens = persist.hermes_request_tokens(messages, tools, tool_choice)
+    except Exception:  # the stream then reports agy's own size
+        logger.debug("Could not estimate the Hermes request size", exc_info=True)
     worker = turn.worker
     assert worker is not None
     stream = AntigravityStream(
@@ -708,6 +763,7 @@ def _start_turn(turn: PersistentTurn, store: PersistStore, key: str, record: dic
         turn_kind="resume" if decision.resume else "refresh",
         conversation_key=f"persist:{key}",
         previous_turn_end=_record_time(record),
+        reported_prompt_tokens=turn.hermes_tokens,
     )
     turn.start_abandon_watchdog()
     return stream
