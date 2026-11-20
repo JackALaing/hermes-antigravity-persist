@@ -452,11 +452,27 @@ class HermesRequestTokensTests(unittest.TestCase):
         compacted = [system, {"role": "user", "content": "[CONTEXT COMPACTION] summary"}, *history[-4:]]
         self.assertLess(persist.hermes_request_tokens(compacted, TOOLS, None), full // 5)
 
-    def test_counts_old_tool_output_as_a_stub_like_a_rebuild(self):
+    def test_counts_every_tool_output_in_full(self):
+        # Final review should-fix: stubbing all but the 8 newest results made
+        # the reported size 13-72% of what Hermes and LCM-X measure, so
+        # mid-turn and native-compression checks barely fired.
         loop = _tool_loop(12, 20_000)
         tokens = persist.hermes_request_tokens(loop, TOOLS, None)
-        self.assertLess(tokens, 10 * 20_000 // 4, "all but the 8 newest results are stubs")
-        self.assertGreater(tokens, 8 * 20_000 // 4)
+        self.assertGreater(tokens, 12 * 20_000 // 4, "old tool output is not stubbed")
+        self.assertLess(tokens, 13 * 20_000 // 4)
+        # Adding older tool output grows the size one for one, past the 8th.
+        longer = _tool_loop(20, 20_000)
+        grown = persist.hermes_request_tokens(longer, TOOLS, None) - tokens
+        self.assertGreater(grown, 8 * 20_000 // 4)
+
+    def test_is_never_below_what_a_rebuild_sends(self):
+        # A rebuild stubs old tool output, so a threshold on this size keeps
+        # every rebuild below it.
+        loop = _tool_loop(12, 20_000)
+        rebuilt = persist.estimate_tokens("\n\n".join(
+            persist._flatten_content(m.get("content"))
+            for m in persist._prune_tool_results(loop, persist.TOOL_RETENTION_STEPS[0])))
+        self.assertGreater(persist.hermes_request_tokens(loop, TOOLS, None), rebuilt)
 
     def test_reads_text_only_and_never_resolves_media(self):
         msgs = [{"role": "user", "content": [

@@ -525,7 +525,8 @@ class PersistentSessionTests(unittest.TestCase):
         client = self._client()
         self._create(client, [{"role": "user", "content": "q"}])
         record = self._record()
-        record.update(seed_failures=session.SEED_FAILURE_LIMIT, needs_refresh=True)
+        record.update(seed_failures=session.SEED_FAILURE_LIMIT, needs_refresh=True,
+                      seed_failure_at=time.time())
         self.store.save(record)
         self._create(client, self._seeded_history())
         refreshed = self.world.procs[-1]
@@ -926,6 +927,22 @@ class PersistentSessionTests(unittest.TestCase):
         self.assertGreater(len(refreshed.received), 1)
         self.assertTrue(refreshed.received[0].startswith("[CONTEXT ONLY"))
         self.assertEqual(self._record()["seed_failures"], 0)
+
+    def test_single_message_rebuilds_of_a_legacy_record_have_lapsed(self):
+        # Final review S2 nit: a record without seed_failure_at must not fall
+        # back to updated_at, which every commit refreshes (it never lapsed).
+        now = time.time()
+        legacy = {"seed_failures": session.SEED_FAILURE_LIMIT, "updated_at": now}
+        self.assertFalse(session._single_message_rebuilds(legacy, now=now))
+        recent = dict(legacy, seed_failure_at=now - 60)
+        self.assertTrue(session._single_message_rebuilds(recent, now=now))
+
+    def test_a_failed_size_estimate_logs_a_warning(self):
+        client = self._client()
+        with patch.object(persist, "hermes_request_tokens", side_effect=ValueError("boom")), \
+                self.assertLogs("session", level="WARNING") as logs:
+            self._create(client, [{"role": "user", "content": "q"}])
+        self.assertTrue(any("Could not estimate the Hermes request size" in line for line in logs.output))
 
     def test_failing_housekeeping_does_not_fail_the_turn(self):
         client = self._client()

@@ -76,10 +76,12 @@ PERSISTENT_ORIGIN = "assistant_tool"
 # Refresh before agy's own conversation grows past this (last step's input
 # plus cache read). Independent of Hermes' compaction: persistent turns report
 # the size of Hermes' own request to Hermes (``hermes_request_tokens``), so
-# Hermes compacts its history on its own measure while agy's live
-# conversation keeps full detail until it reaches this size. A refresh then
-# rebuilds from Hermes' compacted history, which fits the rebuild cap below
-# as long as Hermes' compaction threshold is BELOW REFRESH_MAX_TOKENS.
+# Hermes compacts its history on its own measure. A compaction normally
+# changes the system prompt (Hermes rebuilds it at the boundary), which
+# refreshes on the next turn; otherwise agy's live conversation keeps its
+# detail until it reaches this size. A refresh rebuilds from Hermes'
+# compacted history, which fits the rebuild cap below as long as Hermes'
+# compaction threshold is BELOW REFRESH_MAX_TOKENS.
 # Override: ANTIGRAVITY_REFRESH_SIZE_TOKENS.
 REFRESH_SIZE_TOKENS = 360_000
 # Estimated size cap of a whole refresh rebuild (every seed plus the final
@@ -680,12 +682,14 @@ def hermes_request_tokens(messages: Sequence[Any], tools: list[dict[str, Any]] |
     This is the size a persistent turn reports to Hermes as ``prompt_tokens``
     instead of agy's accumulated conversation, so Hermes' compaction measures
     its own history: after a compaction the next turn reports the reduced
-    size, while agy's conversation keeps its detail until the refresh
-    threshold. It mirrors the one-message prompt a refresh renders (preamble,
-    tool schemas, system prompt, the transcript with all but the newest tool
-    results cut to a stub) without its cap, but reads text only: rendering
-    would resolve media references (writing data URLs to the cache,
-    downloading remote images) on every turn.
+    size (and the system prompt Hermes rebuilds at a compaction normally
+    refreshes agy's conversation from it on that next turn). It counts the preamble, tool schemas, system prompt and the
+    whole transcript, tool output in full, so it measures what Hermes' own
+    estimate, LCM-X and native compression measure. A rebuild only ever
+    sends less (old tool output cut to a stub, the cap), so a compaction
+    threshold below the rebuild cap still guarantees a rebuild that fits.
+    It reads text only: rendering would resolve media references (writing
+    data URLs to the cache, downloading remote images) on every turn.
     """
     sections = [*_PROMPT_PREAMBLE, *_tool_sections(tools, tool_choice)]
     history: list[dict[str, Any]] = []
@@ -696,7 +700,7 @@ def hermes_request_tokens(messages: Sequence[Any], tools: list[dict[str, Any]] |
             sections.append(_flatten_content(message.get("content")))
         else:
             history.append(message)
-    for message in _prune_tool_results(history, TOOL_RETENTION_STEPS[0]):
+    for message in history:
         sections.append(_flatten_content(message.get("content")))
         for call in message.get("tool_calls") or []:
             if isinstance(call, dict):

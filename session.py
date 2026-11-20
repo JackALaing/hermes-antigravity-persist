@@ -145,8 +145,8 @@ def _single_message_rebuilds(record: dict[str, Any] | None, now: float | None = 
     except (TypeError, ValueError):
         last = 0.0
     now = time.time() if now is None else now
-    # A record from before the timestamp existed counts from its last commit.
-    last = last or float(_record_time(record) or 0)
+    # A record without the timestamp (written before it existed) has lapsed:
+    # its last commit time moves on every turn, so it would never expire.
     return now - last < SEED_FAILURE_TTL_SECONDS
 # A persistent turn whose stream nobody has read for this long is abandoned:
 # its worker is killed and the conversation lock released, so later turns do
@@ -743,7 +743,8 @@ def _start_turn(turn: PersistentTurn, store: PersistStore, key: str, record: dic
     try:
         turn.hermes_tokens = persist.hermes_request_tokens(messages, tools, tool_choice)
     except Exception:  # the stream then reports agy's own size
-        logger.debug("Could not estimate the Hermes request size", exc_info=True)
+        logger.warning("Could not estimate the Hermes request size; reporting agy's own "
+                       "conversation size to Hermes for this turn", exc_info=True)
     worker = turn.worker
     assert worker is not None
     stream = AntigravityStream(
