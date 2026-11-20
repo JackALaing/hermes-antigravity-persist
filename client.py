@@ -69,6 +69,14 @@ try:
     from .delivery import DeliveryWatch
     from .stream import AntigravityStream, collect_stream_completion
     from .debug import dump_prompt_debug
+    from .persist import (
+        MAX_STDIN_BYTES,
+        check_stdin_bytes,
+        is_persistent_request,
+        pack_oneshot,
+        utf8_len,
+    )
+    from .session import run_persistent_turn
 except ImportError:
     from models import (
         _FALLBACK_MODELS,
@@ -109,6 +117,14 @@ except ImportError:
     from delivery import DeliveryWatch
     from stream import AntigravityStream, collect_stream_completion
     from debug import dump_prompt_debug
+    from persist import (
+        MAX_STDIN_BYTES,
+        check_stdin_bytes,
+        is_persistent_request,
+        pack_oneshot,
+        utf8_len,
+    )
+    from session import run_persistent_turn
 
 logger = logging.getLogger(__name__)
 
@@ -482,6 +498,9 @@ class AntigravityClient:
         # CPU seconds at the last sign of life: the discriminator between a
         # silent abandoned turn and a silent busy one.
         self._worker_cpu_at_activity: dict[subprocess.Popen, float] = {}
+        # In-flight persistent-conversation turns (session.PersistentTurn);
+        # cancel() and close() abort them. Their workers live in session.py.
+        self._persistent_turns: set[Any] = set()
 
     @staticmethod
     def _resolve_real_token_path() -> Path | None:
@@ -511,7 +530,13 @@ class AntigravityClient:
         if self._cancelled:
             raise RuntimeError("Antigravity request cancelled.")
 
+    def _abort_persistent_turns(self, reason: str) -> None:
+        for turn in tuple(getattr(self, "_persistent_turns", ())):
+            with contextlib.suppress(Exception):
+                turn.abort(reason)
+
     def _cancel_owned_requests(self) -> None:
+        self._abort_persistent_turns("cancelled")
         with self._lock:
             self._terminate_worker_locked()
             # Keep ownership and the lock until reaping finishes: owner close
@@ -548,6 +573,9 @@ class AntigravityClient:
         # conversations/*.db open, and taskkill /F /T is asynchronous, so
         # removing the workspace first would race the OS and fail with
         # WinError 32. Ordering is therefore load-bearing, not cosmetic.
+        # An in-flight persistent turn dies with its client; an idle persistent
+        # worker is left to its idle bound so the next client can reuse it.
+        self._abort_persistent_turns("client closed")
         with self._lock:
             self.is_closed = True
             self._terminate_worker_locked()
@@ -938,13 +966,14 @@ class AntigravityClient:
         tool_choice: Any,
         stream: bool,
     ) -> Any:
-        prompt_text = _format_messages_as_prompt(
+        prompt_text = pack_oneshot(
             messages,
             model=model,
             tools=tools,
             tool_choice=tool_choice,
             media_sink=self._materialized_media,
         )
+        check_stdin_bytes(prompt_text)
         dump_prompt_debug(
             prompt=prompt_text,
             branch="oneshot",
@@ -1022,6 +1051,10 @@ class AntigravityClient:
         reasoning_effort: str | None = None,
         **extra_kwargs: Any,
     ) -> Any:
+        # Private routing hints from build_api_kwargs_extras; popped first so
+        # they reach no log or debug dump.
+        cache_scope = extra_kwargs.pop("_agy_cache_scope", None)
+        write_origin = extra_kwargs.pop("_agy_write_origin", None)
         self._raise_if_cancelled()
         if self.is_closed:
             raise RuntimeError("AntigravityClient is closed.")
@@ -1052,6 +1085,37 @@ class AntigravityClient:
             messages_list, self._materialized_media
         )
 
+        if is_persistent_request(cache_scope, write_origin):
+            persistent_stream = run_persistent_turn(
+                self,
+                scope=cache_scope,
+                model=resolved_model,
+                effort=effort,
+                messages=messages_list,
+                tools=tools,
+                tool_choice=tool_choice,
+                timeout=effective_timeout,
+                media_paths=turn_media_paths,
+                idle_seconds=_worker_idle_seconds(),
+            )
+            if persistent_stream is not None:
+                if stream:
+                    return persistent_stream
+                completion = collect_stream_completion(persistent_stream)
+                self._raise_if_cancelled()
+                return completion
+            # Lock timeout: answer with a one-shot and leave the record alone.
+            self._ensure_worker_media_permissions(turn_media_paths, worker_turn=False)
+            return self._run_oneshot_completion(
+                model=resolved_model,
+                effort=effort,
+                messages=messages_list,
+                timeout=effective_timeout,
+                tools=tools,
+                tool_choice=tool_choice,
+                stream=stream,
+            )
+
         worker_acquired = self._worker_lock.acquire(blocking=False)
         if worker_acquired:
             try:
@@ -1071,16 +1135,20 @@ class AntigravityClient:
                     is_continuation = _messages_match_prefix(ref_history, messages_list)
                     conv_id_to_resume = self._worker_conversation_id if is_continuation else None
 
+                if is_continuation:
+                    prompt_payload = _format_delta_prompt(
+                        messages_list[len(ref_history):],
+                        pending_user_text=_latest_user_text(messages_list),
+                        media_sink=self._materialized_media,
+                    )
+                    # A delta agy would truncate restarts from a packed full send.
+                    if utf8_len(prompt_payload) >= MAX_STDIN_BYTES:
+                        is_continuation = False
+
                 comparable_full_send = not is_continuation
                 if is_continuation:
                     proc = self._get_or_spawn_worker(
                         resolved_model, effort, conversation_id=conv_id_to_resume
-                    )
-                    delta_msgs = messages_list[len(ref_history):]
-                    prompt_payload = _format_delta_prompt(
-                        delta_msgs,
-                        pending_user_text=_latest_user_text(messages_list),
-                        media_sink=self._materialized_media,
                     )
                     dump_prompt_debug(
                         prompt=prompt_payload,
@@ -1094,7 +1162,7 @@ class AntigravityClient:
                             self._terminate_worker_locked(keep_conversation=False)
                             self._purge_isolated_conversations()
                     proc = self._get_or_spawn_worker(resolved_model, effort, conversation_id=None)
-                    prompt_payload = _format_messages_as_prompt(
+                    prompt_payload = pack_oneshot(
                         messages_list,
                         model=resolved_model,
                         tools=tools,
@@ -1108,6 +1176,7 @@ class AntigravityClient:
                         messages=messages_list,
                     )
 
+                check_stdin_bytes(prompt_payload)
                 event_msg = {"event": "user", "message": {"content": prompt_payload}}
                 try:
                     self._raise_if_cancelled()
@@ -1120,7 +1189,7 @@ class AntigravityClient:
                         self._terminate_worker_locked(keep_conversation=False)
                         self._purge_isolated_conversations()
                     proc = self._get_or_spawn_worker(resolved_model, effort, conversation_id=None)
-                    prompt_payload = _format_messages_as_prompt(
+                    prompt_payload = pack_oneshot(
                         messages_list,
                         model=resolved_model,
                         tools=tools,
@@ -1133,6 +1202,7 @@ class AntigravityClient:
                         model=resolved_model,
                         messages=messages_list,
                     )
+                    check_stdin_bytes(prompt_payload)
                     event_msg = {"event": "user", "message": {"content": prompt_payload}}
                     self._raise_if_cancelled()
                     proc.stdin.write(json.dumps(event_msg) + "\n")

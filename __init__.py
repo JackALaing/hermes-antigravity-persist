@@ -39,13 +39,13 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Single-turn prompt ceiling measured against agy 1.x (issue #49): the CLI
-# silently truncates a Gemini-route prompt at ~75,800 input tokens, keeps the
-# head and drops the tail, and reports no error. In an agent loop the tail is
-# the fresh tool output, so Hermes must compact before agy starts discarding
-# it. Claude routes accepted >122k input with no observed cap below the
-# compiled multi-turn trajectory threshold, so they keep the full default.
-_GEMINI_SINGLE_TURN_CONTEXT = 75_000
+# Gemini routes keep their history in a persistent agy conversation (see
+# persist.py), so the prompt agy receives per turn is a delta, not the whole
+# history: the old 75,000-token single-turn cap (issue #49) no longer bounds
+# the conversation. Every stdin write is held under agy's 180,000-byte limit
+# instead, and the plugin refreshes its agy conversation at 360,000 tokens.
+# Hermes compaction still governs the history it keeps.
+_GEMINI_DECLARED_CONTEXT = 1_000_000
 _DEFAULT_CONTEXT_LENGTH = 239_000
 _CONTEXT_LENGTH_OVERRIDE_VARS = (
     "HERMES_ANTIGRAVITY_CONTEXT_LENGTHS",
@@ -80,11 +80,10 @@ def _context_length_overrides() -> dict[str, int]:
 
 
 def resolve_context_length(model: str) -> int:
-    """Single-turn context length for *model*, per-family where measured.
+    """Declared context length for *model*, per family.
 
-    Exact-name overrides beat family overrides; the measured Gemini ceiling
-    (75k, head-kept truncation) applies to every ``gemini-*`` route, effort
-    suffixes included.
+    Exact-name overrides beat family overrides; the Gemini window applies to
+    every ``gemini-*`` route, effort suffixes included.
     """
     base, _effort = split_effort_suffix(model.strip().lower())
     overrides = _context_length_overrides()
@@ -92,8 +91,18 @@ def resolve_context_length(model: str) -> int:
         if name and name in overrides:
             return overrides[name]
     if base.startswith("gemini"):
-        return _GEMINI_SINGLE_TURN_CONTEXT
+        return _GEMINI_DECLARED_CONTEXT
     return _DEFAULT_CONTEXT_LENGTH
+
+
+def _current_write_origin() -> str:
+    """Hermes' write origin for the running turn ('' when unavailable)."""
+    try:
+        from tools.skill_provenance import get_current_write_origin
+
+        return str(get_current_write_origin() or "")
+    except Exception:
+        return ""
 
 
 class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
@@ -132,7 +141,14 @@ class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
         model: str | None = None,
         **context: Any,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Extract reasoning effort and forward as top-level api_kwargs to AntigravityClient."""
+        """Forward reasoning effort and the conversation routing hints.
+
+        ``cache_scope_id`` (the rotation-stable conversation scope) and the
+        current write origin decide whether the client keeps a persistent agy
+        conversation for this request: only main-agent turns
+        (``assistant_tool``) with a scope do. The client pops both private
+        keys before anything is logged.
+        """
         effort = None
         if isinstance(reasoning_config, dict):
             if reasoning_config.get("enabled") is False:
@@ -142,6 +158,10 @@ class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
         top_level: dict[str, Any] = {}
         if effort:
             top_level["reasoning_effort"] = str(effort).strip().lower()
+        scope = context.get("cache_scope_id")
+        if isinstance(scope, str) and scope.strip():
+            top_level["_agy_cache_scope"] = scope
+            top_level["_agy_write_origin"] = _current_write_origin()
         return {}, top_level
 
     def fetch_models(
@@ -166,9 +186,10 @@ class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
     def get_model_context_length(self, model: str) -> int | None:
         """Declared context window for Antigravity CLI, per model family.
 
-        Gemini routes declare 75,000 tokens: agy 1.x silently truncates a
-        single-turn Gemini prompt at ~75,800 input tokens, keeps the head and
-        drops the tail (issue #49), so Hermes compaction must fire below that.
+        Gemini routes declare 1,000,000 tokens: main-agent turns run in a
+        persistent agy conversation that receives only each turn's delta,
+        and every stdin write is kept under agy's byte limit, so the old
+        75,000-token single-turn cap (issue #49) no longer applies.
         Claude routes have no observed single-turn cap under the compiled
         trajectory threshold and keep the 239,000 default (239,616 tokens /
         256k - 16k output tokens). Multi-turn trajectory persistence via
@@ -249,6 +270,9 @@ def _classify_antigravity_error(
             "empty result (status=\"success\")",
             "max_trajectory_tokens",
             "max trajectory tokens",
+            # persist.StdinPayloadTooLarge: compaction shrinks the request.
+            "exceeds agy's stdin limit",
+            "exceed agy's stdin limit",
         )
     ):
         return {

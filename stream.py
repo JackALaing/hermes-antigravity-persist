@@ -256,7 +256,9 @@ class AntigravityStream(Iterator[Any]):
         timeout: float,
         tools: list[dict[str, Any]] | None = None,
         is_worker: bool = False,
-        worker_lock: threading.Lock | None = None,
+        # threading.Lock, or persist.ConversationLock for persistent turns:
+        # anything with an idempotent-safe release().
+        worker_lock: Any = None,
         worker_lock_held: bool | None = None,
         messages: list[dict[str, Any]] | None = None,
         usage_baseline: dict[str, int] | None = None,
