@@ -300,13 +300,23 @@ class SummaryAndLoopPackingTests(unittest.TestCase):
             "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted into the summary below.",
             "[PRIOR CONTEXT — for reference only; not a new message]\nstuff",
             "[Current user objective preserved from compacted history]\nfix the build",
-            "intro\n[Recent Summary (d0, node 12)]\nthe deploy key lives in vault B",
-            "[Session Arc Summary (d1, node 3)]\n...",
-            "body\n--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---",
+            "[Recent Summary (d0, node 12)]\nthe deploy key lives in vault B",
+            "  [Session Arc Summary (d1, node 3)]\n...",
+            "[CONTEXT SUMMARY]: legacy handoff",
         ]
         for text in summaries:
             with self.subTest(text[:30]):
                 self.assertTrue(persist.is_summary_message({"role": "user", "content": text}))
+        # Markers count only at the start: a message quoting one is ordinary
+        # history, not a mandatory summary moved ahead of everything else.
+        quoting = [
+            "intro\n[Recent Summary (d0, node 12)]\nthe deploy key lives in vault B",
+            "body\n--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---",
+            "LCM printed: [CONTEXT COMPACTION — REFERENCE ONLY] ...",
+        ]
+        for text in quoting:
+            with self.subTest(text[:30]):
+                self.assertFalse(persist.is_summary_message({"role": "user", "content": text}))
         self.assertTrue(persist.is_summary_message(
             {"role": "assistant", "content": [{"type": "text", "text": summaries[0]}]}))
         self.assertFalse(persist.is_summary_message({"role": "user", "content": "please summarize this"}))
@@ -384,6 +394,76 @@ class SummaryAndLoopPackingTests(unittest.TestCase):
         self.assertRegex("\n".join(logs.output), r"only fits with the 1 newest tool result")
         for payload in out:
             self.assertLess(utf8_len(payload), MAX_STDIN_BYTES)
+
+
+    def test_single_message_keeps_summaries_ahead_of_ordinary_history(self):
+        # Review S1 (h525_probe_single_summary): a 118 KB prefix and a 60 KB
+        # summary used to lose the summary while 21 newer ordinary pieces stayed.
+        system = {"role": "system", "content": ("Hermes SOUL and skills. " * 8000)[:118_000]}
+        for summary_kb in (60, 80):
+            with self.subTest(summary_kb=summary_kb):
+                summary = ("[Recent Summary (d0, node 7)]\nFACT-SUMMARY-QX "
+                           + ("summary words here " * 6000)[:summary_kb * 1000])
+                msgs = [system, {"role": "user", "content": summary}, {"role": "assistant", "content": "ok"}]
+                for i in range(10):
+                    msgs += [{"role": "user", "content": f"note {i} " + "ordinary " * 400},
+                             {"role": "assistant", "content": f"ack {i}"}]
+                msgs.append({"role": "user", "content": "What is FACT-SUMMARY-QX?"})
+                with self.assertLogs("persist", level="WARNING"):
+                    out = pack_oneshot(msgs, model="m", tools=TOOLS, tool_choice=None)
+                self.assertLess(utf8_len(out), MAX_STDIN_BYTES)
+                self.assertIn("FACT-SUMMARY-QX ", out)
+                self.assertIn("What is FACT-SUMMARY-QX?", out)
+                self.assertIn("[summary truncated to fit]", out)
+                self.assertNotIn("note 0 ", out, "ordinary history yields to the summary")
+                self.assertLess(out.index("FACT-SUMMARY-QX "), out.index("earlier messages omitted]"))
+
+    def test_single_message_keeps_the_newest_summary_pieces_when_not_all_fit(self):
+        system = {"role": "system", "content": "s" * 120_000}
+        summaries = [{"role": "user", "content": f"[Depth-{d} Summary (d{d}, node {d})]\nSUM-{d} " + "w" * 30_000}
+                     for d in (3, 2, 1)]
+        msgs = [system, *summaries, {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": "ordinary " * 500}, {"role": "assistant", "content": "fine"},
+                {"role": "user", "content": "LATEST ASK"}]
+        with self.assertLogs("persist", level="WARNING") as logs:
+            out = pack_oneshot(msgs, model="m", tools=TOOLS, tool_choice=None)
+        self.assertLess(utf8_len(out), MAX_STDIN_BYTES)
+        self.assertIn("LATEST ASK", out)
+        self.assertIn("SUM-1 ", out, "the newest summary is kept")
+        self.assertIn("SUM-2 ", out, "the next one is cut rather than dropped")
+        self.assertNotIn("SUM-3 ", out, "the oldest summary piece goes first")
+        self.assertLess(out.index("SUM-2 "), out.index("[summary truncated to fit]"), )
+        self.assertLess(out.index("[summary truncated to fit]"), out.index("SUM-1 "))
+        self.assertNotIn("ordinary ordinary", out, "ordinary history only gets what summaries leave")
+        self.assertIn("summary pieces", "\n".join(logs.output))
+
+
+class HermesRequestTokensTests(unittest.TestCase):
+    """Review B2: the size reported to Hermes for persistent turns."""
+
+    def test_reflects_hermes_history_and_shrinks_after_compaction(self):
+        system = {"role": "system", "content": "SOUL"}
+        history = [system]
+        for i in range(40):
+            history += [{"role": "user", "content": f"q{i} " + "w " * 2000},
+                        {"role": "assistant", "content": f"a{i}"}]
+        full = persist.hermes_request_tokens(history, TOOLS, None)
+        self.assertGreater(full, 40 * 1000)
+        compacted = [system, {"role": "user", "content": "[CONTEXT COMPACTION] summary"}, *history[-4:]]
+        self.assertLess(persist.hermes_request_tokens(compacted, TOOLS, None), full // 5)
+
+    def test_counts_old_tool_output_as_a_stub_like_a_rebuild(self):
+        loop = _tool_loop(12, 20_000)
+        tokens = persist.hermes_request_tokens(loop, TOOLS, None)
+        self.assertLess(tokens, 10 * 20_000 // 4, "all but the 8 newest results are stubs")
+        self.assertGreater(tokens, 8 * 20_000 // 4)
+
+    def test_reads_text_only_and_never_resolves_media(self):
+        msgs = [{"role": "user", "content": [
+            {"type": "text", "text": "look"},
+            {"type": "image_url", "image_url": {"url": "https://example.invalid/cat.png"}}]}]
+        with patch("prompt._materialize_media", side_effect=AssertionError("media resolved")):
+            self.assertGreater(persist.hermes_request_tokens(msgs, None, None), 0)
 
 
 class ByteGuardTests(unittest.TestCase):

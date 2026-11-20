@@ -737,18 +737,17 @@ def _final_message(header: str | None, entries: list[str], closing: list[str]) -
 # message), which is exactly what an oldest-first cap would drop first. They
 # are mandatory in a rebuild, kept right after the static prefix. Hermes
 # strips its private ``_compressed_summary`` key before providers see the
-# request, so detection is by the markers the compactors write.
+# request, so detection is by the markers the compactors write, anchored at
+# the start of the message: a message that merely quotes a header is ordinary.
 _SUMMARY_PREFIXES = (
     "[CONTEXT COMPACTION",
+    "[CONTEXT SUMMARY]:",
     "[PRIOR CONTEXT",
     "[Current user objective preserved from compacted history]",
     "[Your active task list was preserved",
     "[Planning state preserved",
 )
-_SUMMARY_MARKER_RE = re.compile(
-    r"--- END OF CONTEXT SUMMARY"
-    r"|\[(?:Recent|Session Arc|Durable|Depth-\d+) Summary \(d\d+, node \d+\)\]"
-)
+_SUMMARY_HEADER_RE = re.compile(r"\[(?:Recent|Session Arc|Durable|Depth-\d+) Summary \(d\d+, node \d+\)\]")
 
 
 def is_summary_message(message: Any) -> bool:
@@ -756,7 +755,7 @@ def is_summary_message(message: Any) -> bool:
     if _role(message) not in ("user", "assistant"):
         return False
     text = _flatten_content(message.get("content")).lstrip()
-    return text.startswith(_SUMMARY_PREFIXES) or bool(_SUMMARY_MARKER_RE.search(text))
+    return text.startswith(_SUMMARY_PREFIXES) or bool(_SUMMARY_HEADER_RE.match(text))
 
 
 # How many of the newest tool results keep their full output in a split
@@ -819,6 +818,9 @@ def _prefix_sections(messages, tools, tool_choice, media_sink) -> list[str]:
             "refusing to send a truncated prompt."
         )
     return sections
+
+
+_SUMMARY_TRUNCATED = "\n[summary truncated to fit]"
 
 
 def _omission_marker(count: int) -> str:
@@ -948,22 +950,39 @@ def _pack_single(history: list[dict[str, Any]], prefix: list[str], media_sink: O
     active_pieces = _presplit(active, capacity // 2)
     marker_reserve = utf8_len(_omission_marker(len(older_pieces) + len(summary_pieces))) + 64
     base = _joined_len(prefix) + _joined_len(closing) + marker_reserve + 64
-    head: list[str] = []
-    if summary_pieces and base + _joined_len(summary_pieces) + _joined_len(active_pieces) + 4 < capacity:
-        head = summary_pieces
-        base += _joined_len(summary_pieces) + 2
-    else:  # no room to keep them whole: they compete like any old message
-        older_pieces = summary_pieces + older_pieces
+    # Summaries come before ordinary history: they take the room the active
+    # loop leaves (the newest summary pieces first, if not all fit), and
+    # ordinary history only what is left after them.
+    dropped_summaries = list(summary_pieces)
+    summary_room = capacity - _joined_len(active_pieces) - 2
+    head = _fill_from_end(dropped_summaries, summary_room, base)
+    if head:
+        base += _joined_len(head) + 2
+    truncated = 0
+    room = summary_room - base - utf8_len(_SUMMARY_TRUNCATED) - 2
+    if dropped_summaries and room >= 1024:
+        # The next summary piece does not fit whole: keep its beginning
+        # rather than give its room to ordinary history.
+        piece = dropped_summaries.pop()
+        cut = _split_text_bytes(piece, room)[0] + _SUMMARY_TRUNCATED
+        truncated = utf8_len(piece) - utf8_len(cut)
+        head = [cut] + head
+        base += utf8_len(cut) + 2
     entries = older_pieces + active_pieces
     tail = _fill_from_end(entries, capacity, base)
     _require_active(len(entries), len(older_pieces))
-    marker = [_omission_marker(len(entries))] if entries else []
-    if entries:
+    omitted = dropped_summaries + entries
+    marker = [_omission_marker(len(omitted))] if omitted else []
+    if omitted:
         logger.warning(
-            "Antigravity one-shot prompt omits the %d oldest history piece(s) (~%d estimated tokens) "
-            "to fit agy's %d-byte stdin limit; kept %d", len(entries),
-            sum(estimate_tokens(e) for e in entries), MAX_STDIN_BYTES, len(tail),
+            "Antigravity one-shot prompt omits the %d oldest history piece(s) (~%d estimated tokens, "
+            "%d of them summary pieces) to fit agy's %d-byte stdin limit; kept %d and %d summary piece(s)",
+            len(omitted), sum(estimate_tokens(e) for e in omitted), len(dropped_summaries),
+            MAX_STDIN_BYTES, len(tail), len(head),
         )
+    if truncated:
+        logger.warning("Antigravity one-shot prompt cut the oldest kept summary piece by %d bytes "
+                       "to fit agy's %d-byte stdin limit", truncated, MAX_STDIN_BYTES)
     return [_single_message(prefix, head + marker, tail, closing)]
 
 
