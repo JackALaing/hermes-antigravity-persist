@@ -55,6 +55,7 @@ try:
         terminate_process,
         write_media_read_permissions,
     )
+    from .models import split_effort_suffix
     from .prompt import _latest_user_text
     from .stream import AntigravityStream, _StepUsage, _delta_worker_usage
 except ImportError:
@@ -81,10 +82,15 @@ except ImportError:
         terminate_process,
         write_media_read_permissions,
     )
+    from models import split_effort_suffix
     from prompt import _latest_user_text
     from stream import AntigravityStream, _StepUsage, _delta_worker_usage
 
 logger = logging.getLogger(__name__)
+
+
+def _base_model(model: str) -> str:
+    return split_effort_suffix(model)[0]
 
 
 class ResumeRejected(Exception):
@@ -300,7 +306,7 @@ class PersistentTurn:
                 "scope_hash": self._key,
                 "agy_conversation_id": worker.conversation_id,
                 "last_reply_fp": reply_fingerprint(reply),
-                "model": self._model,
+                "model": _base_model(self._model),
                 "effort": self._effort,
                 "tools_hash": self._tools_hash,
                 "agy_size_tokens": size,
@@ -506,7 +512,9 @@ def _start_turn(turn: PersistentTurn, store: PersistStore, key: str, record: dic
     if required_rules and not required_rules <= read_media_rules(store.gemini_dir):
         write_media_read_permissions(store.gemini_dir, media_paths)
 
-    decision = decide(record, messages, model=model, tools_hash=turn._tools_hash)
+    # The resolved id carries the effort suffix; an effort change alone must
+    # resume (respawning with --conversation), so compare the base model.
+    decision = decide(record, messages, model=_base_model(model), tools_hash=turn._tools_hash)
     payloads: list[str] = []
     pending: list[str] = []
     if decision.resume:
