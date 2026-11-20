@@ -1093,6 +1093,92 @@ def _messages_match_prefix(history: Sequence[dict[str, Any]], incoming: Sequence
     return True
 
 
+def _render_transcript_entry(msg: dict[str, Any], media_sink: Optional[set] = None) -> str:
+    """Render one non-system message as a transcript entry ('' when empty)."""
+    role = str(msg.get("role") or "").strip().lower()
+    rendered_content = _render_message_content(msg.get("content"), media_sink)
+    if role == "tool":
+        tool_id = str(msg.get("tool_call_id") or msg.get("name") or "tool").strip()
+        if len(rendered_content) > 20000:
+            rendered_content = (
+                rendered_content[:12000]
+                + f"\n[... large tool output truncated: {len(rendered_content)} chars ...]\n"
+                + rendered_content[-3000:]
+            )
+        return f"Tool Result ({tool_id}):\n{rendered_content}"
+    if role == "assistant":
+        subparts = []
+        if "Tool Result (" in rendered_content:
+            rendered_content = rendered_content.split("Tool Result (")[0].strip()
+        if rendered_content:
+            subparts.append(rendered_content)
+        if tool_calls := msg.get("tool_calls"):
+            for tc in tool_calls:
+                if isinstance(tc, dict):
+                    fn = tc.get("function") or {}
+                    call_obj = {
+                        "id": tc.get("id") or "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": fn.get("name", ""),
+                            "arguments": fn.get("arguments", "{}") if isinstance(fn.get("arguments"), str) else json.dumps(fn.get("arguments", {}), ensure_ascii=False)
+                        }
+                    }
+                    subparts.append(f"<tool_call>{json.dumps(call_obj, ensure_ascii=False)}</tool_call>")
+        return ("Assistant:\n" + "\n".join(subparts)) if subparts else ""
+    label = _ROLE_LABELS.get(role, "Context")
+    return f"{label}:\n{rendered_content}" if rendered_content else ""
+
+
+def _delta_parts(
+    new_messages: Sequence[dict[str, Any]],
+    pending_user_text: str = "",
+    media_sink: Optional[set] = None,
+) -> tuple[list[str], list[str]]:
+    """Transcript entries and closing sections of a delta prompt.
+
+    Split out of _format_delta_prompt so callers that must spread a delta
+    across several stdin writes (persist.py) keep the exact same rendering.
+    A trailing user request is not an entry: it is restated in the closing.
+    """
+    valid_messages = [m for m in new_messages if isinstance(m, dict)]
+    if not valid_messages:
+        return [], []
+
+    last_msg = valid_messages[-1]
+    last_role = str(last_msg.get("role") or "").strip().lower()
+
+    recovery_turn = last_role == "user" and _is_recovery_nudge(last_msg)
+    if last_role == "user" and not recovery_turn:
+        prior_messages = valid_messages[:-1]
+    else:
+        prior_messages = valid_messages
+
+    entries = [
+        entry
+        for entry in (_render_transcript_entry(msg, media_sink) for msg in prior_messages)
+        if entry
+    ]
+
+    closing: list[str] = []
+    if last_role == "tool":
+        closing.append(
+            "Continue the conversation from the latest tool result. "
+            "REMINDER: You are in HEADLESS INFERENCE MODE. Native function-calling and native tools are disabled. "
+            "If you need to call a tool, emit ONLY <tool_call>{...}</tool_call> blocks in plain text with valid JSON and a properly JSON-escaped 'arguments' string. "
+            "Never invoke native tools or emit native functionCall blocks."
+        )
+        if pending_user_text:
+            closing.append(_pending_user_request_section(pending_user_text))
+    elif last_role == "user":
+        user_text = (pending_user_text or _latest_user_text(valid_messages)) if recovery_turn else _render_message_content(last_msg.get("content"), media_sink)
+        if user_text:
+            closing.append(_latest_user_request_section(user_text))
+    else:
+        closing.append("Continue the conversation from the latest message above.")
+    return entries, closing
+
+
 def _format_delta_prompt(
     new_messages: Sequence[dict[str, Any]],
     pending_user_text: str = "",
@@ -1104,74 +1190,10 @@ def _format_delta_prompt(
     A tool-result delta does not contain it, so the caller passes it in and it
     is restated after the continue instruction.
     """
-    valid_messages = [m for m in new_messages if isinstance(m, dict)]
-    if not valid_messages:
+    entries, closing = _delta_parts(new_messages, pending_user_text, media_sink)
+    if not entries and not closing:
         return ""
-
-    last_msg = valid_messages[-1]
-    last_role = str(last_msg.get("role") or "").strip().lower()
-
-    recovery_turn = last_role == "user" and _is_recovery_nudge(last_msg)
-    if last_role == "user" and not recovery_turn:
-        prior_messages = valid_messages[:-1]
-    else:
-        prior_messages = valid_messages
-
-    parts: list[str] = []
-    for msg in prior_messages:
-        role = str(msg.get("role") or "").strip().lower()
-        rendered_content = _render_message_content(msg.get("content"), media_sink)
-        if role == "tool":
-            tool_id = str(msg.get("tool_call_id") or msg.get("name") or "tool").strip()
-            if len(rendered_content) > 20000:
-                rendered_content = (
-                    rendered_content[:12000]
-                    + f"\n[... large tool output truncated: {len(rendered_content)} chars ...]\n"
-                    + rendered_content[-3000:]
-                )
-            parts.append(f"Tool Result ({tool_id}):\n{rendered_content}")
-            continue
-        if role == "assistant":
-            subparts = []
-            if "Tool Result (" in rendered_content:
-                rendered_content = rendered_content.split("Tool Result (")[0].strip()
-            if rendered_content:
-                subparts.append(rendered_content)
-            if tool_calls := msg.get("tool_calls"):
-                for tc in tool_calls:
-                    if isinstance(tc, dict):
-                        fn = tc.get("function") or {}
-                        call_obj = {
-                            "id": tc.get("id") or "call_1",
-                            "type": "function",
-                            "function": {
-                                "name": fn.get("name", ""),
-                                "arguments": fn.get("arguments", "{}") if isinstance(fn.get("arguments"), str) else json.dumps(fn.get("arguments", {}), ensure_ascii=False)
-                            }
-                        }
-                        subparts.append(f"<tool_call>{json.dumps(call_obj, ensure_ascii=False)}</tool_call>")
-            if subparts:
-                parts.append("Assistant:\n" + "\n".join(subparts))
-            continue
-        label = _ROLE_LABELS.get(role, "Context")
-        if rendered_content:
-            parts.append(f"{label}:\n{rendered_content}")
-
-    if last_role == "tool":
-        parts.append(
-            "Continue the conversation from the latest tool result. "
-            "REMINDER: You are in HEADLESS INFERENCE MODE. Native function-calling and native tools are disabled. "
-            "If you need to call a tool, emit ONLY <tool_call>{...}</tool_call> blocks in plain text with valid JSON and a properly JSON-escaped 'arguments' string. "
-            "Never invoke native tools or emit native functionCall blocks."
-        )
-        if pending_user_text:
-            parts.append(_pending_user_request_section(pending_user_text))
-    elif last_role == "user":
-        user_text = (pending_user_text or _latest_user_text(valid_messages)) if recovery_turn else _render_message_content(last_msg.get("content"), media_sink)
-        if user_text:
-            parts.append(_latest_user_request_section(user_text))
-    else:
-        parts.append("Continue the conversation from the latest message above.")
+    parts = [*entries, *closing]
     return "\n\n".join(s.strip() for s in _apply_media_viewing_protocol(parts) if s and s.strip())
 
 
