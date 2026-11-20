@@ -1089,9 +1089,51 @@ def build_child_env(isolated_home: Path | str) -> dict[str, str]:
     return env
 
 
+_LOG_PID_RE = re.compile(r"Starting language server process with pid (\d+)")
+_LOG_PID_CACHE: dict[str, int | None] = {}
+
+
+def _log_pid(path: Path) -> int | None:
+    """The agy process a cli log belongs to (agy names its pid near the top)."""
+    key = str(path)
+    if key in _LOG_PID_CACHE:
+        return _LOG_PID_CACHE[key]
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+            head = handle.read(8192)
+    except OSError:
+        return None
+    match = _LOG_PID_RE.search(head)
+    pid = int(match.group(1)) if match else None
+    if pid is not None or len(head) >= 8192:
+        if len(_LOG_PID_CACHE) > 512:
+            _LOG_PID_CACHE.clear()
+        _LOG_PID_CACHE[key] = pid
+    return pid
+
+
+def _select_quota_log(log_files: list[Path], pid: int | None) -> Path | None:
+    """The newest log, or with ``pid`` the log of that process.
+
+    Persistent conversations share one agy home, so the newest log may belong
+    to another conversation's process. When no log names any pid (an older or
+    newer agy log format), fall back to the newest log as before.
+    """
+    if pid is None:
+        return log_files[0]
+    named = False
+    for path in log_files[:20]:
+        owner = _log_pid(path)
+        if owner == pid:
+            return path
+        named = named or owner is not None
+    return None if named else log_files[0]
+
+
 def _check_early_quota_error(
     gemini_dir: Path | str | None,
     min_mtime: float | None = None,
+    pid: int | None = None,
 ) -> str | None:
     """Check isolated agy logs for early RESOURCE_EXHAUSTED / 429 quota exhaustion.
 
@@ -1117,7 +1159,9 @@ def _check_early_quota_error(
         if not log_files:
             return None
 
-        latest_log = log_files[0]
+        latest_log = _select_quota_log(log_files, pid)
+        if latest_log is None:
+            return None
         if min_mtime is not None:
             # Allow 2.0s margin for filesystem timestamp resolution
             if latest_log.stat().st_mtime < (min_mtime - 2.0):

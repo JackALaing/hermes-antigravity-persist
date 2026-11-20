@@ -2383,6 +2383,35 @@ class AntigravityPluginTests(unittest.TestCase):
             err_future = _check_early_quota_error(tmp_path, min_mtime=time.time() + 100)
             self.assertIsNone(err_future)
 
+    def test_quota_check_reads_only_the_log_of_the_given_process(self):
+        # Persistent conversations share one agy home and its log directory.
+        quota = ("I0921 21:19:51.264799 299 run.go:395] Run: attempt 1 failed "
+                 "(RESOURCE_EXHAUSTED (code 429): Individual quota reached.), retrying in 4s\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            log_dir = tmp_path / "log"
+            log_dir.mkdir()
+            mine = log_dir / "cli-20261120_010000.log"
+            other = log_dir / "cli-20261120_010500.log"
+            mine.write_text("I1120 01:00:00.1 41 server.go:2650] Starting language server process "
+                            "with pid 111\n", encoding="utf-8")
+            other.write_text("I1120 01:05:00.1 41 server.go:2650] Starting language server process "
+                             "with pid 222\n" + quota, encoding="utf-8")
+            os.utime(mine, (time.time() - 60, time.time() - 60))
+            self.assertIsNone(_check_early_quota_error(tmp_path, pid=111),
+                              "another conversation's quota line is not ours")
+            self.assertIsNotNone(_check_early_quota_error(tmp_path, pid=222))
+            self.assertIsNotNone(_check_early_quota_error(tmp_path), "no pid: newest log, as before")
+            self.assertIsNone(_check_early_quota_error(tmp_path, pid=333))
+            # Logs that name no pid (another agy log format): newest log, as before.
+            for path in (mine, other):
+                path.write_text(quota, encoding="utf-8")
+            with tempfile.TemporaryDirectory() as tmp2:
+                unnamed = Path(tmp2) / "log"
+                unnamed.mkdir()
+                (unnamed / "cli-1.log").write_text(quota, encoding="utf-8")
+                self.assertIsNotNone(_check_early_quota_error(Path(tmp2), pid=111))
+
     def test_early_quota_watchdog_abort(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

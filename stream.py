@@ -311,6 +311,11 @@ class _AwaitableCompletion(SimpleNamespace):
         return _ready(self).__await__()
 
 
+def _proc_pid(proc: Any) -> int | None:
+    pid = getattr(proc, "pid", None)
+    return pid if isinstance(pid, int) else None
+
+
 class AntigravityStream(Iterator[Any]):
     """Streaming iterator yielding OpenAI ChatCompletionChunk objects from CLI stream-json."""
 
@@ -929,7 +934,7 @@ class AntigravityStream(Iterator[Any]):
                 while not watchdog_stop.wait(timeout=0.3):
                     if time.monotonic() - start_time < 1.0:
                         continue
-                    quota_err = _check_early_quota_error(gemini_dir, min_mtime=start_wall)
+                    quota_err = _check_early_quota_error(gemini_dir, min_mtime=start_wall, pid=_proc_pid(self.proc))
                     if quota_err:
                         self._early_error = quota_err
                         logger.warning(
@@ -1288,7 +1293,7 @@ class AntigravityStream(Iterator[Any]):
                 # not this exit-code one. A real nonzero exit keeps the
                 # quota/exit-code raise's priority over the generic one.
                 if not neutralized_tool_step and not has_tool_calls and not has_content and returncode not in (None, 0):
-                    quota_err = _check_early_quota_error(gemini_dir, min_mtime=start_wall)
+                    quota_err = _check_early_quota_error(gemini_dir, min_mtime=start_wall, pid=_proc_pid(self.proc))
                     if quota_err:
                         raise RuntimeError(f"Antigravity model error: {quota_err}")
                     err_detail = error_msg or stderr_out.strip() or f"Process exited with return code {returncode}"
@@ -1346,7 +1351,7 @@ class AntigravityStream(Iterator[Any]):
 
                 worker_exit = self.proc.poll()
                 if not neutralized_tool_step and not has_tool_calls and not has_content and worker_exit not in (None, 0):
-                    quota_err = _check_early_quota_error(gemini_dir, min_mtime=start_wall)
+                    quota_err = _check_early_quota_error(gemini_dir, min_mtime=start_wall, pid=_proc_pid(self.proc))
                     if quota_err:
                         raise RuntimeError(f"Antigravity model error: {quota_err}")
                     stderr_out = self._get_stderr_tail()

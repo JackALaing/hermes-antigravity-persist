@@ -189,7 +189,7 @@ def test_watchdog_keeps_probing_after_init_and_uses_wallclock_mtime():
     client._isolated_gemini_dir = "/fixture/gemini"
     probe_calls: list[float | None] = []
 
-    def probe(_gemini_dir, min_mtime=None):
+    def probe(_gemini_dir, min_mtime=None, pid=None):
         probe_calls.append(min_mtime)
         return None
 
