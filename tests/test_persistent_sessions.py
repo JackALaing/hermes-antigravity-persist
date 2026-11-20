@@ -11,6 +11,7 @@ import queue
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -107,8 +108,12 @@ class FakeAgy:
             self.first = False
             self._emit({"event": "init", "conversation_id": self.conversation,
                         "init": {"model": "m"}})
-        if content.startswith("[CONTEXT ONLY"):
+        seed = content.startswith("[CONTEXT ONLY")
+        if seed:
             reply = self.world.seed_reply
+            if self.world.seed_tool:
+                self._emit({"event": "step_update", "step_update": {
+                    "conversation_id": self.conversation, "step_type": "tool", "tool": "run_command"}})
         else:
             reply = self.world.next_reply()
         n = len(self.world.conversations[self.conversation])
@@ -122,7 +127,8 @@ class FakeAgy:
         for field, value in usage.items():
             self.cumulative[field] = self.cumulative.get(field, 0) + value
         self._emit({"event": "result", "result": {
-            "conversation_id": self.conversation, "status": "SUCCESS", "response": reply,
+            "conversation_id": self.conversation,
+            "status": self.world.seed_status if seed else "SUCCESS", "response": reply,
             "usage": dict(self.cumulative)}})
 
 
@@ -133,6 +139,8 @@ class World:
         self.procs = []
         self.replies = []
         self.seed_reply = "ACK"
+        self.seed_status = "SUCCESS"
+        self.seed_tool = False
         self.lose_conversations = False
         self.no_step_usage = False
 
@@ -438,25 +446,77 @@ class PersistentSessionTests(unittest.TestCase):
         self.assertEqual(completion.usage.prompt_tokens, 100 * n + 1000 * n)
         self.assertEqual(completion.usage.completion_tokens, 7)
 
-    def test_non_ack_seed_aborts_discards_conversation_and_raises(self):
-        client = self._client()
-        history = []
+    @staticmethod
+    def _seeded_history():
+        history = [{"role": "system", "content": "SYS"}]
         for i in range(120):
             history += [{"role": "user", "content": f"u{i} " + "x" * 3000},
                         {"role": "assistant", "content": f"a{i} " + "x" * 3000}]
         history.append({"role": "user", "content": "FINAL"})
-        self.world.seed_reply = "Sure, here is a summary of the context"
-        with self.assertRaisesRegex(RuntimeError, "not acknowledged"):
-            self._create(client, history)
+        return history
+
+    def test_any_successful_seed_reply_is_accepted_whatever_its_text(self):
+        client = self._client()
+        self.world.seed_reply = "Acknowledged. I will follow the operating contract and wait."
+        self.world.replies = ["the answer"]
+        completion = self._create(client, self._seeded_history())
+        self.assertEqual(completion.choices[0].message.content, "the answer")
         proc = self.world.procs[0]
-        self.assertEqual(len(proc.received), 1, "the real turn is never sent")
-        self.assertEqual(proc.returncode, -9)
-        conv_dir = self.store.gemini_dir / "conversations"
-        self.assertFalse((conv_dir / f"{proc.conversation}.db").exists())
-        self.assertNotIn((str(self.store.root), self.key), session._REGISTRY)
-        # The lock was released: the next turn proceeds.
-        self.world.seed_reply = "ACK"
-        self._create(client, history)
+        self.assertEqual(len(self.world.procs), 1)
+        self.assertGreater(len(proc.received), 2)
+        self.assertEqual(self._record().get("seed_failures"), 0)
+
+    def test_rejected_seed_falls_back_to_one_packed_message(self):
+        for name, setup in (("native tool", lambda w: setattr(w, "seed_tool", True)),
+                            ("status", lambda w: setattr(w, "seed_status", "ERROR"))):
+            with self.subTest(name):
+                session._REGISTRY.clear()
+                self.world.procs.clear()
+                self.world.seed_tool, self.world.seed_status = False, "SUCCESS"
+                setup(self.world)
+                self.world.replies = ["the answer"]
+                self.store.record_path(self.key).unlink(missing_ok=True)
+                client = self._client()
+                with self.assertLogs("session", level="WARNING") as logs:
+                    completion = self._create(client, self._seeded_history())
+                self.assertEqual(completion.choices[0].message.content, "the answer")
+                first, second = self.world.procs
+                self.assertEqual(first.returncode, -9)
+                self.assertEqual(len(first.received), 1, "the real turn never reached the seeded run")
+                conv_dir = self.store.gemini_dir / "conversations"
+                self.assertFalse((conv_dir / f"{first.conversation}.db").exists())
+                self.assertEqual(len(second.received), 1)
+                self.assertFalse(second.received[0].startswith("[CONTEXT ONLY"))
+                self.assertIn("FINAL", second.received[0])
+                self.assertIn("earlier messages omitted]", second.received[0])
+                self.assertLess(persist.utf8_len(second.received[0]), persist.MAX_STDIN_BYTES)
+                record = self._record()
+                self.assertEqual(record["agy_conversation_id"], second.conversation)
+                self.assertEqual(record["seed_failures"], 1)
+                text = "\n".join(logs.output)
+                self.assertIn("rebuilding as a single message", text)
+                self.assertNotIn("Acknowledged", text)
+
+    def test_repeated_seed_failures_skip_seeds_on_later_refreshes(self):
+        client = self._client()
+        self._create(client, [{"role": "user", "content": "q"}])
+        record = self._record()
+        record.update(seed_failures=session.SEED_FAILURE_LIMIT, needs_refresh=True)
+        self.store.save(record)
+        self._create(client, self._seeded_history())
+        refreshed = self.world.procs[-1]
+        self.assertEqual(len(refreshed.received), 1)
+        self.assertFalse(refreshed.received[0].startswith("[CONTEXT ONLY"))
+
+    def test_seed_error_messages_carry_no_model_text(self):
+        failure = persist.ack_failure(saw_result=True, status="SUCCESS", error="", native_tool=False)
+        self.assertIsNone(failure)
+        failure = persist.ack_failure(saw_result=True, status="FAILED: secret model words " * 5,
+                                      error="", native_tool=False)
+        assert failure is not None
+        self.assertLess(len(failure), 60)
+        self.assertEqual(persist.ack_failure(saw_result=True, status="SUCCESS", error="boom: model text",
+                                             native_tool=False), "agy reported an error")
 
     def test_oversized_resume_delta_is_split_with_request_last(self):
         client = self._client()
@@ -541,6 +601,190 @@ class PersistentSessionTests(unittest.TestCase):
         t.join(10)
         self.assertFalse(t.is_alive())
         self.assertEqual(len(results), 1)
+
+
+    # -- refresh triggers added after review --------------------------------
+    def _next_turn(self, client, m1, c1, *, system=None, prior_user=None):
+        m2 = m1 + [self._reply(c1), {"role": "user", "content": "next"}]
+        if system is not None:
+            m2[0] = {"role": "system", "content": system}
+        if prior_user is not None:
+            m2[len(m1) - 1] = {"role": "user", "content": prior_user}
+        self._create(client, m2)
+        return self.world.procs[-1]
+
+    def test_system_prompt_change_refreshes_but_model_and_provider_lines_do_not(self):
+        base = "Rules v1\nModel: gemini-3.8-flash\nProvider: antigravity\n"
+        cases = (
+            ("model line", base.replace("gemini-3.8-flash", "gemini-3.1-pro"), True, {}),
+            ("instructions", base.replace("v1", "v2"), False, {}),
+            ("instructions, check off", base.replace("v1", "v2"), True,
+             {"ANTIGRAVITY_REFRESH_ON_SYSTEM_CHANGE": "0"}),
+        )
+        for name, new_system, resumes, env in cases:
+            with self.subTest(name), patch.dict(os.environ, env):
+                session._REGISTRY.clear()
+                self.world.procs.clear()
+                self.store.record_path(self.key).unlink(missing_ok=True)
+                client = self._client()
+                m1 = [{"role": "system", "content": base}, {"role": "user", "content": "q"}]
+                c1 = self._create(client, m1)
+                last = self._next_turn(client, m1, c1, system=new_system)
+                if resumes:
+                    self.assertEqual(len(self.world.procs), 1)
+                    self.assertNotIn("Rules", last.received[-1])
+                else:
+                    self.assertEqual(len(self.world.procs), 2)
+                    self.assertIn("Rules v2", last.received[0])
+
+    def test_undo_to_an_identical_reply_after_a_different_request_refreshes(self):
+        client = self._client()
+        self.world.replies = ["Done.", "Done."]
+        m1 = [{"role": "user", "content": "rename the file"}]
+        c1 = self._create(client, m1)
+        # /undo, then a different request that happened to get the same reply.
+        last = self._next_turn(client, m1, c1, prior_user="delete the file")
+        workers = [p for p in self.world.procs if "stream-json" in p.cmd]
+        self.assertEqual(len(workers), 2, "a fresh conversation, not a resume")
+        self.assertNotIn("--conversation", last.cmd)
+        self.assertIn("delete the file", last.received[0])
+
+    def test_claude_routes_do_not_persist(self):
+        self.assertFalse(persist.is_persistent_request(SCOPE, "assistant_tool", "claude-sonnet-4-6"))
+        self.assertTrue(persist.is_persistent_request(SCOPE, "assistant_tool", MODEL))
+        client = self._client()
+        with patch.object(AntigravityClient, "_run_oneshot_completion", return_value="per-client"), \
+                patch.object(AntigravityClient, "_get_or_spawn_worker",
+                             side_effect=RuntimeError("per-client path")):
+            with self.assertRaises(RuntimeError):
+                self._create(client, [{"role": "user", "content": "q"}], model="claude-sonnet-4-6")
+        self.assertIsNone(self._record())
+        self.assertEqual(self.world.procs, [])
+
+    def test_live_worker_is_reused_only_with_the_records_commit_token(self):
+        client = self._client()
+        m1 = [{"role": "user", "content": "q"}]
+        c1 = self._create(client, m1)
+        record = self._record()
+        self.assertTrue(record["commit_token"])
+        # Another Hermes process advanced the conversation: same id, new token.
+        record["commit_token"] = "f" * 16
+        self.store.save(record)
+        self._next_turn(client, m1, c1)
+        self.assertEqual(len(self.world.procs), 2)
+        self.assertEqual(self.world.procs[0].returncode, -9, "the stale worker is replaced")
+        self.assertIn("--conversation", self.world.procs[1].cmd, "and the conversation resumed")
+        self.assertEqual(self._record()["commit_token"], session._registered(
+            (str(self.store.root), self.key)).commit_token)
+
+    def test_abandoned_stream_releases_the_lock(self):
+        client = self._client()
+        with patch.dict(os.environ, {"ANTIGRAVITY_PERSIST_ABANDON_SECONDS": "0.2"}):
+            # Never read and never closed, but still referenced (as from a
+            # reference cycle the collector has not reached yet).
+            stream = self._create(client, [{"role": "user", "content": "q"}], stream=True)
+            lock = persist.ConversationLock(self.store.lock_path(self.key))
+            self.assertFalse(lock.acquire(0), "the live turn holds the lock")
+            lock = persist.ConversationLock(self.store.lock_path(self.key))
+            deadline = time.monotonic() + 5
+            acquired = False
+            while time.monotonic() < deadline and not acquired:
+                acquired = lock.acquire(0)
+                time.sleep(0.05)
+            self.assertTrue(acquired, "the abandoned turn released its lock")
+            lock.release()
+        self.assertEqual(self.world.procs[0].returncode, -9)
+        del stream
+        record = self._record()
+        self.assertTrue(record is None or record["needs_refresh"])
+
+    def test_steady_reader_is_not_abandoned(self):
+        client = self._client()
+        with patch.dict(os.environ, {"ANTIGRAVITY_PERSIST_ABANDON_SECONDS": "0.3"}):
+            chunks = []
+            for chunk in self._create(client, [{"role": "user", "content": "q"}], stream=True):
+                chunks.append(chunk)
+                time.sleep(0.1)
+        self.assertTrue(chunks)
+        self.assertFalse(self._record()["needs_refresh"])
+
+    def test_rejected_resume_gets_a_fresh_deadline_for_the_refresh(self):
+        client = self._client()
+        m1 = [{"role": "user", "content": "plant"}]
+        c1 = self._create(client, m1)
+        self.world.procs[0].kill()
+        session._REGISTRY.clear()
+        self.world.lose_conversations = True
+        clock = [1000.0]
+        budgets = []
+        original = session.PersistentTurn.write
+
+        def slow_write(turn, payload, deadline):
+            budgets.append(deadline - clock[0])
+            try:
+                return original(turn, payload, deadline)
+            finally:
+                clock[0] += 55.0  # the rejected handshake used most of a 60s budget
+
+        m2 = m1 + [self._reply(c1), {"role": "user", "content": "recall"}]
+        with patch("session.time.monotonic", side_effect=lambda: clock[0]), \
+                patch.object(session.PersistentTurn, "write", slow_write):
+            client.chat.completions.create(model=MODEL, messages=m2, tools=TOOLS, timeout=60,
+                                           _agy_cache_scope=SCOPE, _agy_write_origin="assistant_tool")
+        self.assertEqual(budgets, [60.0, 60.0])
+
+    def test_close_after_the_finish_chunk_keeps_the_worker(self):
+        client = self._client()
+        m1 = [{"role": "user", "content": "q"}]
+        stream = self._create(client, m1, stream=True)
+        reply = ""
+        for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta.content:
+                reply += chunk.choices[0].delta.content
+            if chunk.choices and chunk.choices[0].finish_reason:
+                break
+        stream.close()
+        self.assertIsNone(self.world.procs[0].returncode)
+        self.assertFalse(self._record()["needs_refresh"])
+        m2 = m1 + [{"role": "assistant", "content": reply}, {"role": "user", "content": "next"}]
+        self._create(client, m2)
+        self.assertEqual(len(self.world.procs), 1, "the next turn reuses the worker")
+
+    def test_unusable_state_directory_falls_back_to_one_shot(self):
+        client = self._client()
+        with patch.object(PersistStore, "ensure", side_effect=PermissionError("read-only")), \
+                patch.object(AntigravityClient, "_run_oneshot_completion",
+                             return_value="oneshot") as oneshot, \
+                self.assertLogs("session", level="WARNING"):
+            self.assertEqual(self._create(client, [{"role": "user", "content": "q"}]), "oneshot")
+        oneshot.assert_called_once()
+
+    def test_handshake_auth_contention_retries_once(self):
+        client = self._client()
+
+        class _Drainer:
+            def get_tail(self):
+                return "E1120 error getting token source: not logged into antigravity"
+
+        proc = type("P", (), {"_stderr_drainer": _Drainer()})()
+        failure = RuntimeError("Antigravity worker exited during init")
+        failure.agy_proc = proc  # type: ignore[attr-defined]
+        calls = []
+
+        def fake_run(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise failure
+            return "stream"
+
+        with patch("client.run_persistent_turn", side_effect=fake_run), \
+                self.assertLogs("client", level="WARNING"):
+            self.assertEqual(self._create(client, [{"role": "user", "content": "q"}], stream=True),
+                             "stream")
+        self.assertEqual(len(calls), 2)
+        with patch("client.run_persistent_turn", side_effect=RuntimeError("other")):
+            with self.assertRaisesRegex(RuntimeError, "other"):
+                self._create(client, [{"role": "user", "content": "q"}], stream=True)
 
 
 class KwargsForwardingTests(unittest.TestCase):

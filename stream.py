@@ -426,7 +426,21 @@ class AntigravityStream(Iterator[Any]):
             self.close()
             raise RuntimeError("Antigravity request cancelled.")
 
+    def _note_pull(self, active: bool) -> None:
+        # Persistent turns watch for consumers that stop reading (abandon
+        # watchdog in session.py); per-client turns have no such hook.
+        note = getattr(self.client, "_note_consumer_pull", None)
+        if callable(note):
+            note(active)
+
     def __next__(self) -> Any:
+        self._note_pull(True)
+        try:
+            return self._next_chunk()
+        finally:
+            self._note_pull(False)
+
+    def _next_chunk(self) -> Any:
         self._raise_if_cancelled()
         if self._closed:
             raise StopIteration

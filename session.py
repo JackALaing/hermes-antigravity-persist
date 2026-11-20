@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import threading
 import time
@@ -44,7 +45,9 @@ try:
         reply_fingerprint,
         scope_key,
         split_delta,
+        system_hash,
         tools_hash,
+        user_fingerprint,
     )
     from .process import (
         _own_process_group,
@@ -71,7 +74,9 @@ except ImportError:
         reply_fingerprint,
         scope_key,
         split_delta,
+        system_hash,
         tools_hash,
+        user_fingerprint,
     )
     from process import (
         _own_process_group,
@@ -107,6 +112,31 @@ class ResumeRejected(Exception):
     """agy did not reopen the recorded conversation; refresh instead."""
 
 
+class SeedRejected(RuntimeError):
+    """A context-only part was not accepted; rebuild as one message instead."""
+
+
+# After this many rejected context-only parts on one Hermes conversation, its
+# refreshes skip seeds and send one packed message (oldest history omitted).
+SEED_FAILURE_LIMIT = 2
+# A persistent turn whose stream nobody has read for this long is abandoned:
+# its worker is killed and the conversation lock released, so later turns do
+# not wait for garbage collection. A live consumer is either blocked inside a
+# read (never counted) or handling one chunk, which takes far less.
+# Override: ANTIGRAVITY_PERSIST_ABANDON_SECONDS; 0 or less disables.
+DEFAULT_ABANDON_SECONDS = 180.0
+
+
+def _abandon_seconds() -> float:
+    raw = os.environ.get("ANTIGRAVITY_PERSIST_ABANDON_SECONDS", "").strip()
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return DEFAULT_ABANDON_SECONDS
+
+
 class _Worker:
     def __init__(self, proc: subprocess.Popen, model: str, effort: str | None,
                  media_rules: frozenset[str], expected_conversation: str | None):
@@ -121,6 +151,10 @@ class _Worker:
         # result.usage is cumulative per process: the fallback baseline.
         self.usage_baseline: dict[str, int] = {}
         self.idle_timer: threading.Timer | None = None
+        # The record's commit token after this worker's last committed turn. A
+        # live worker is reused only while the record still carries it: another
+        # Hermes process may have advanced the conversation since.
+        self.commit_token: str | None = None
 
     def alive(self) -> bool:
         return self.proc.poll() is None
@@ -242,7 +276,8 @@ class PersistentTurn:
 
     def __init__(self, client: Any, store: PersistStore, key: str, lock: ConversationLock, *,
                  model: str, effort: str | None, tools_hash_value: str,
-                 previous: dict[str, Any] | None, idle_seconds: float):
+                 previous: dict[str, Any] | None, idle_seconds: float,
+                 messages: list[dict[str, Any]] | None = None):
         self._client = client
         self._store = store
         self._key = key
@@ -256,10 +291,17 @@ class PersistentTurn:
         self._lock = threading.RLock()
         self._active_processes: set = set()
         self._isolated_gemini_dir = store.gemini_dir
+        self._messages = list(messages or [])
+        self._system_hash = system_hash(self._messages)
         self.worker: _Worker | None = None
         self.seed_tokens = 0
+        self.seed_failed = False
         self.committed = False
         self.finished = False
+        # Abandon watchdog (see DEFAULT_ABANDON_SECONDS).
+        self._pulling = False
+        self._last_pull = time.monotonic()
+        self._watch_stop = threading.Event()
 
     # -- attributes AntigravityStream reads -------------------------------
     @property
@@ -292,6 +334,37 @@ class PersistentTurn:
     def _note_worker_activity(self, proc: subprocess.Popen) -> None:
         return None
 
+    def _note_consumer_pull(self, active: bool) -> None:
+        """AntigravityStream calls this around every read its consumer makes."""
+        with self._lock:
+            self._pulling = active
+            self._last_pull = time.monotonic()
+
+    def start_abandon_watchdog(self) -> None:
+        grace = _abandon_seconds()
+        if grace <= 0 or self.finished or self.committed:
+            return
+        with self._lock:
+            self._last_pull = time.monotonic()
+        thread = threading.Thread(target=self._watch_abandon, args=(grace,), daemon=True,
+                                  name="agy-persist-abandon")
+        thread.start()
+
+    def _watch_abandon(self, grace: float) -> None:
+        interval = min(max(grace / 6.0, 0.02), 30.0)
+        while not self._watch_stop.wait(interval):
+            if self.finished or self.committed:
+                return
+            with self._lock:
+                idle = 0.0 if self._pulling else time.monotonic() - self._last_pull
+            if idle >= grace:
+                logger.warning(
+                    "Persistent agy turn abandoned: its stream was not read for %.0fs; "
+                    "stopping the worker and releasing the conversation lock", idle,
+                )
+                self.abort("stream abandoned")
+                return
+
     def _on_worker_turn_success(self, stream: AntigravityStream, step_usage: _StepUsage,
                                 usage_data: dict[str, Any]) -> None:
         self.commit(stream.reply_message(), step_usage, usage_data)
@@ -311,11 +384,16 @@ class PersistentTurn:
             previous = self._previous or {}
             same_conversation = previous.get("agy_conversation_id") == worker.conversation_id
             now = time.time()
+            token = os.urandom(8).hex()
             record = {
                 "version": persist.RECORD_VERSION,
                 "scope_hash": self._key,
                 "agy_conversation_id": worker.conversation_id,
                 "last_reply_fp": reply_fingerprint(reply),
+                "last_user_fp": user_fingerprint(self._messages, len(self._messages)),
+                "system_hash": self._system_hash,
+                "commit_token": token,
+                "seed_failures": int(previous.get("seed_failures") or 0) + (1 if self.seed_failed else 0),
                 "model": _base_model(self._model),
                 "effort": self._effort,
                 "tools_hash": self._tools_hash,
@@ -327,6 +405,7 @@ class PersistentTurn:
                 "updated_at": now,
             }
             self._store.save(record)
+            worker.commit_token = token
             self.committed = True
             if previous.get("agy_conversation_id") and not same_conversation:
                 self._store.delete_conversation(previous["agy_conversation_id"])
@@ -345,6 +424,13 @@ class PersistentTurn:
         if self.finished:
             return
         worker = self.worker
+        if self.committed:
+            # agy finished the turn and the record names it: a close or cancel
+            # after the finish chunk must not cost the next turn a respawn.
+            if worker is not None and _registered(self._registry_key) is worker:
+                _arm_idle_timer(self._store, self._registry_key, worker, self._idle_seconds)
+            self._finish()
+            return
         _kill_worker(self._registry_key, worker)
         if not self.committed:
             logger.info("Persistent agy turn aborted (%s); marking for refresh", reason)
@@ -355,8 +441,17 @@ class PersistentTurn:
                 self._store.delete_conversation(worker.conversation_id)
         self._finish()
 
+    def discard_worker(self) -> None:
+        """Kill this turn's worker and drop the conversation it started (not recorded)."""
+        worker, self.worker = self.worker, None
+        _kill_worker(self._registry_key, worker)
+        previous_id = (self._previous or {}).get("agy_conversation_id")
+        if worker is not None and worker.conversation_id and worker.conversation_id != previous_id:
+            self._store.delete_conversation(worker.conversation_id)
+
     def _finish(self) -> None:
         self.finished = True
+        self._watch_stop.set()
         self._turn_lock.release()
         turns = getattr(self._client, "_persistent_turns", None)
         if turns is not None:
@@ -427,7 +522,7 @@ class PersistentTurn:
         """Read a context-only part's reply internally and require an ACK."""
         worker = self.worker
         assert worker is not None
-        text, status, error = "", "", ""
+        status, error = "", ""
         saw_result = native_tool = False
         steps = _StepUsage()
         result_usage: dict[str, Any] = {}
@@ -451,14 +546,11 @@ class PersistentTurn:
                     break
                 if isinstance(step.get("usage"), dict):
                     steps.add(step["usage"])
-                text += str(step.get("text_delta") or "")
             elif kind == "result":
                 result = event.get("result") or {}
                 saw_result = True
                 status = str(result.get("status") or "")
                 error = str(result.get("error") or "")
-                if not text:
-                    text = str(result.get("response") or "")
                 if isinstance(result.get("usage"), dict):
                     result_usage = result["usage"]
                 break
@@ -466,10 +558,9 @@ class PersistentTurn:
             _delta_worker_usage(result_usage, worker.usage_baseline)
         tokens = (steps.context_tokens + steps.output_sum) if steps.seen else 0
         self.seed_tokens += tokens
-        failure = ack_failure(saw_result=saw_result, status=status, error=error, text=text,
-                              native_tool=native_tool)
+        failure = ack_failure(saw_result=saw_result, status=status, error=error, native_tool=native_tool)
         if failure:
-            raise RuntimeError(f"Antigravity execution failed: context restore was not acknowledged ({failure})")
+            raise SeedRejected(f"Antigravity execution failed: context restore was not acknowledged ({failure})")
         logger.info("Antigravity context restore acknowledged (%d tokens; input=%d cache_read=%d hit=%.1f%%)",
                     tokens, steps.input_sum, steps.cache_read_sum,
                     cache_hit_pct(steps.input_sum, steps.cache_read_sum))
@@ -488,19 +579,25 @@ def run_persistent_turn(
     media_paths: set[str],
     idle_seconds: float,
 ) -> AntigravityStream | None:
-    """Start one persistent turn; None when the lock timed out (use a one-shot)."""
+    """Start one persistent turn; None when the conversation is unavailable
+    (lock timeout, unusable state directory): the caller uses a one-shot."""
     store = PersistStore(persist.persist_root())
-    store.ensure()
     key = scope_key(scope)
     lock = ConversationLock(store.lock_path(key))
-    if not lock.acquire(persist.LOCK_TIMEOUT_SECONDS):
+    try:
+        store.ensure()
+        acquired = lock.acquire(persist.LOCK_TIMEOUT_SECONDS)
+    except Exception:
+        logger.warning("Persistent agy state unavailable; using a one-shot", exc_info=True)
+        return None
+    if not acquired:
         logger.warning("Persistent agy conversation busy for %.0fs; using a one-shot",
                        persist.LOCK_TIMEOUT_SECONDS)
         return None
     record = store.load(key)
     turn = PersistentTurn(client, store, key, lock, model=model, effort=effort,
                           tools_hash_value=tools_hash(tools), previous=record,
-                          idle_seconds=idle_seconds)
+                          idle_seconds=idle_seconds, messages=messages)
     turns = getattr(client, "_persistent_turns", None)
     if turns is not None:
         turns.add(turn)
@@ -509,7 +606,13 @@ def run_persistent_turn(
                            tools=tools, tool_choice=tool_choice, timeout=timeout,
                            media_paths=media_paths)
     except BaseException as exc:
+        proc = turn._worker_proc
         turn.abort(f"{type(exc).__name__}: {exc}")
+        if proc is not None and isinstance(exc, Exception):
+            try:  # the caller's auth-contention check reads the worker's stderr
+                exc.agy_proc = proc  # type: ignore[attr-defined]
+            except Exception:
+                pass
         raise
 
 
@@ -526,7 +629,8 @@ def _start_turn(turn: PersistentTurn, store: PersistStore, key: str, record: dic
 
     # The resolved id carries the effort suffix; an effort change alone must
     # resume (respawning with --conversation), so compare the base model.
-    decision = decide(record, messages, model=_base_model(model), tools_hash=turn._tools_hash)
+    decision = decide(record, messages, model=_base_model(model), tools_hash=turn._tools_hash,
+                      system_hash=turn._system_hash)
     payloads: list[str] = []
     pending: list[str] = []
     if decision.resume:
@@ -538,6 +642,7 @@ def _start_turn(turn: PersistentTurn, store: PersistStore, key: str, record: dic
         reusable = (
             worker is not None and worker.alive() and not worker.awaiting_init
             and worker.conversation_id == conversation_id
+            and bool(record.get("commit_token")) and worker.commit_token == record.get("commit_token")
             and worker.model == model and worker.effort == effort
             and required_rules <= worker.media_rules
         )
@@ -550,26 +655,43 @@ def _start_turn(turn: PersistentTurn, store: PersistStore, key: str, record: dic
         except ResumeRejected as exc:
             logger.info("agy did not resume conversation %s (%s); refreshing", conversation_id, exc)
             decision = persist.Decision(False, f"resume rejected: {exc}")
+            # The failed handshake may have spent the whole budget.
+            deadline = time.monotonic() + timeout
         else:
             logger.debug("Resuming persistent agy conversation (%d message(s))", len(decision.delta))
     if not decision.resume:
         logger.info("Refreshing persistent agy conversation: %s", decision.reason)
         store.gc()
+        single = int((record or {}).get("seed_failures") or 0) >= SEED_FAILURE_LIMIT
         payloads = pack_refresh(messages, model=model, tools=tools, tool_choice=tool_choice,
-                                media_sink=media_sink)
+                                media_sink=media_sink, max_messages=1 if single else None)
         turn.spawn(None)
         pending = turn.write(payloads[0], deadline)
 
     # Each context-only part gets the full timeout, and so does the real turn
     # after the last one: a long rebuild must not starve the answer.
-    for payload in payloads[1:]:
-        turn.consume_seed(pending, deadline)
+    try:
+        for payload in payloads[1:]:
+            turn.consume_seed(pending, deadline)
+            deadline = time.monotonic() + timeout
+            pending = turn.write(payload, deadline)
+    except SeedRejected as exc:
+        # Never fail the conversation over a context-only part: start again
+        # from one packed message (the newest history that fits, with the
+        # prefix and any compaction summary).
+        logger.warning("%s; rebuilding as a single message", exc)
+        turn.discard_worker()
+        turn.seed_failed = True
+        decision = persist.Decision(False, "context restore rejected")
+        payloads = pack_refresh(messages, model=model, tools=tools, tool_choice=tool_choice,
+                                media_sink=media_sink, max_messages=1)
         deadline = time.monotonic() + timeout
-        pending = turn.write(payload, deadline)
+        turn.spawn(None)
+        pending = turn.write(payloads[0], deadline)
 
     worker = turn.worker
     assert worker is not None
-    return AntigravityStream(
+    stream = AntigravityStream(
         proc=worker.proc,
         client=turn,
         model=model,
@@ -587,3 +709,5 @@ def _start_turn(turn: PersistentTurn, store: PersistStore, key: str, record: dic
         conversation_key=f"persist:{key}",
         previous_turn_end=_record_time(record),
     )
+    turn.start_abandon_watchdog()
+    return stream

@@ -790,6 +790,41 @@ class AntigravityClient:
         finally:
             self._worker_lock.release()
 
+    def _start_persistent_turn(self, *, scope: str, model: str, effort: Any, messages: list,
+                               tools: Any, tool_choice: Any, timeout: float, media_paths: Any,
+                               auth_retry: bool = True) -> Any:
+        """run_persistent_turn with the per-client path's auth-contention retry.
+
+        A worker that dies during the handshake while its stderr shows OAuth
+        contention with another agy session is retried once (spawning re-syncs
+        the isolated token).
+        """
+        def attempt() -> Any:
+            return run_persistent_turn(
+                self,
+                scope=scope,
+                model=model,
+                effort=effort,
+                messages=messages,
+                tools=tools,
+                tool_choice=tool_choice,
+                timeout=timeout,
+                media_paths=media_paths,
+                idle_seconds=_worker_idle_seconds(),
+            )
+
+        try:
+            return attempt()
+        except Exception as exc:
+            proc = getattr(exc, "agy_proc", None)
+            if not auth_retry or proc is None or not _stderr_shows_auth_contention(proc):
+                raise
+            self._raise_if_cancelled()
+            logger.warning(
+                "Persistent agy worker failed amid token-source auth errors; retrying once."
+            )
+            return attempt()
+
     def _note_worker_activity(self, proc: subprocess.Popen) -> None:
         """Stamp a worker as alive; AntigravityStream calls this per stdout line.
 
@@ -1093,9 +1128,8 @@ class AntigravityClient:
             messages_list, self._materialized_media
         )
 
-        if is_persistent_request(cache_scope, write_origin):
-            persistent_stream = run_persistent_turn(
-                self,
+        if is_persistent_request(cache_scope, write_origin, resolved_model):
+            persistent_stream = self._start_persistent_turn(
                 scope=cache_scope,
                 model=resolved_model,
                 effort=effort,
@@ -1104,13 +1138,35 @@ class AntigravityClient:
                 tool_choice=tool_choice,
                 timeout=effective_timeout,
                 media_paths=turn_media_paths,
-                idle_seconds=_worker_idle_seconds(),
             )
             if persistent_stream is not None:
                 if stream:
                     return persistent_stream
                 completion = collect_stream_completion(persistent_stream)
                 self._raise_if_cancelled()
+                if _empty_no_result(completion) and _stderr_shows_auth_contention(
+                    persistent_stream.proc
+                ):
+                    # As on the per-client path: one retry on a fresh worker.
+                    # The aborted turn marked the record for refresh.
+                    logger.warning(
+                        "Persistent agy turn ended with no result amid token-source auth errors; "
+                        "retrying once."
+                    )
+                    retry_stream = self._start_persistent_turn(
+                        scope=cache_scope,
+                        model=resolved_model,
+                        effort=effort,
+                        messages=messages_list,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                        timeout=effective_timeout,
+                        media_paths=turn_media_paths,
+                        auth_retry=False,
+                    )
+                    if retry_stream is not None:
+                        completion = collect_stream_completion(retry_stream)
+                        self._raise_if_cancelled()
                 return completion
             # Lock timeout: answer with a one-shot and leave the record alone.
             self._ensure_worker_media_permissions(turn_media_paths, worker_turn=False)

@@ -42,6 +42,7 @@ def _record(reply, **over):
         "version": persist.RECORD_VERSION, "scope_hash": "k", "agy_conversation_id": "conv-1",
         "last_reply_fp": reply_fingerprint(reply), "model": "m", "effort": "low",
         "tools_hash": tools_hash(TOOLS), "agy_size_tokens": 1000, "needs_refresh": False,
+        "last_user_fp": persist.user_fingerprint([{"role": "user", "content": "fix it"}], 1),
     }
     record.update(over)
     return record

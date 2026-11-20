@@ -197,7 +197,15 @@ def scope_key(scope: str) -> str:
     return hashlib.sha256(scope.encode("utf-8")).hexdigest()[:32]
 
 
-def is_persistent_request(scope: Any, origin: Any) -> bool:
+def is_persistent_request(scope: Any, origin: Any, model: Any = None) -> bool:
+    """Main-agent turns persist; Claude routes keep the per-client path.
+
+    agy checkpoints Claude conversations at about 239,616 tokens, below the
+    360,000-token refresh threshold, so a persistent Claude conversation would
+    be compacted by agy before the plugin refreshed it.
+    """
+    if isinstance(model, str) and "claude" in model.lower():
+        return False
     return bool(isinstance(scope, str) and scope.strip()) and origin == PERSISTENT_ORIGIN
 
 
@@ -428,6 +436,40 @@ def tools_hash(tools: Sequence[Any] | None) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+# Hermes writes the active model and provider into the system prompt; a
+# fallback switch or an effort change must not count as an instruction change
+# (the model is compared on its own).
+_VOLATILE_SYSTEM_LINE_RE = re.compile(r"^[ \t]*(?:Model|Provider)[ \t]*:.*$", re.MULTILINE)
+
+
+def system_hash(messages: Sequence[Any]) -> str:
+    """sha256 of the system messages without their Model:/Provider: lines."""
+    parts = [_flatten_content(m.get("content")) for m in messages if _role(m) == "system"]
+    text = _VOLATILE_SYSTEM_LINE_RE.sub("", "\n\n".join(parts))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def refresh_on_system_change() -> bool:
+    """Whether a changed system prompt forces a refresh (default on)."""
+    raw = os.environ.get("ANTIGRAVITY_REFRESH_ON_SYSTEM_CHANGE", "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def user_fingerprint(messages: Sequence[Any], before: int) -> str:
+    """sha256 of the latest real user message before index ``before`` ('' if none).
+
+    Paired with the reply fingerprint, it tells an undo back to an identical
+    earlier reply ("Done.") from the turn agy actually saw. Hermes replays the
+    exact API content of earlier user turns (memory and plugin context
+    included), so the text is stable from one turn to the next.
+    """
+    for index in range(min(before, len(messages)) - 1, -1, -1):
+        message = messages[index]
+        if _role(message) == "user" and not _is_recovery_nudge(message):
+            return hashlib.sha256(visible_text(message.get("content")).encode("utf-8")).hexdigest()
+    return ""
+
+
 def _role(message: Any) -> str:
     return str(message.get("role") or "").strip().lower() if isinstance(message, dict) else ""
 
@@ -457,6 +499,7 @@ def decide(
     *,
     model: str,
     tools_hash: str,
+    system_hash: str | None = None,
 ) -> Decision:
     """Resume the recorded agy conversation, or refresh, and why.
 
@@ -464,7 +507,10 @@ def decide(
     incoming history's LAST assistant message ends: any assistant message
     after ours (a fallback provider's answer, a fork's reply, a placeholder
     row) is something agy never saw. An effort change alone still resumes;
-    the caller respawns the worker with ``--conversation``.
+    the caller respawns the worker with ``--conversation``. The user request
+    that reply answered must match too (an undo back to an identical earlier
+    reply), and so must the system prompt (instructions deployed while the
+    conversation lives) unless ``ANTIGRAVITY_REFRESH_ON_SYSTEM_CHANGE=0``.
     """
     if record is None:
         return Decision(False, "no record")
@@ -478,11 +524,15 @@ def decide(
         return Decision(False, "model changed")
     if record.get("tools_hash") != tools_hash:
         return Decision(False, "tools changed")
+    if system_hash is not None and refresh_on_system_change() and record.get("system_hash") != system_hash:
+        return Decision(False, "system prompt changed")
     if int(record.get("agy_size_tokens") or 0) > refresh_size_tokens():
         return Decision(False, "conversation size")
     index = last_assistant_index(messages)
     if index is None or reply_fingerprint(messages[index]) != record.get("last_reply_fp"):
         return Decision(False, "fingerprint mismatch")
+    if user_fingerprint(messages, index) != record.get("last_user_fp"):
+        return Decision(False, "earlier request changed")
     delta = [m for m in messages[index + 1:] if isinstance(m, dict)]
     if not delta:
         return Decision(False, "empty delta")
@@ -909,20 +959,21 @@ def split_delta(
 # --------------------------------------------------------------------------
 
 
-def ack_failure(
-    *, saw_result: bool, status: str, error: str, text: str, native_tool: bool
-) -> str | None:
-    """Why a context-only seed reply is unacceptable, or None when it is an ACK."""
+def ack_failure(*, saw_result: bool, status: str, error: str, native_tool: bool) -> str | None:
+    """Why a context-only seed reply is unacceptable, or None when it is accepted.
+
+    The reply text is ignored: seed replies are consumed here and never
+    executed or shown, and a real system prompt may make the model answer
+    "Acknowledged." or restate its rules instead of a bare ACK. What matters
+    is that agy finished the turn and ran no native tool. The reasons carry no
+    model text.
+    """
     if not saw_result:
         return "no result event"
     if error:
-        return f"error {error!r}"
+        return "agy reported an error"
     if status != "SUCCESS":
-        return f"status {status!r}"
+        return f"status {status[:40]!r}"
     if native_tool:
         return "native tool step"
-    if "<tool_call>" in text:
-        return "tool call"
-    if not text.strip().startswith("ACK"):
-        return f"reply {text.strip()[:40]!r}"
     return None
