@@ -1112,6 +1112,9 @@ def _log_pid(path: Path) -> int | None:
     return pid
 
 
+_QUOTA_LOG_SCAN_LIMIT = 400
+
+
 def _select_quota_log(log_files: list[Path], pid: int | None) -> Path | None:
     """The newest log, or with ``pid`` the log of that process.
 
@@ -1122,7 +1125,11 @@ def _select_quota_log(log_files: list[Path], pid: int | None) -> Path | None:
     if pid is None:
         return log_files[0]
     named = False
-    for path in log_files[:20]:
+    # Every recent log, not just the newest few: a long-lived worker's log
+    # falls behind those of busier conversations in the shared home. Log
+    # pids are cached and logs over three days old are collected, so this
+    # stays cheap.
+    for path in log_files[:_QUOTA_LOG_SCAN_LIMIT]:
         owner = _log_pid(path)
         if owner == pid:
             return path

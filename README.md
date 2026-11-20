@@ -277,6 +277,15 @@ git clone https://github.com/soyelmismo/hermes-antigravity-subscription.git \
 hermes plugins enable antigravity-subscription-directsdk
 ```
 
+> **Keeping this fork installed**: the fork's version `1.0.29+persist.1` sorts below any later upstream release, so an unpinned install from the upstream URL would be replaced by a plugin update. Install the fork pinned to an exact commit, which Hermes' update check reports as pinned and never moves on its own:
+>
+> ```bash
+> hermes plugins install <fork-git-url> --ref <40-character-commit-sha> --force
+> hermes plugins check-updates   # lists it as "pinned @ <sha>"
+> ```
+>
+> A copy placed straight into the plugins folder has no install provenance and is never auto-updated either. Moving the pin later takes an explicit reinstall with a new `--ref`.
+
 > **Directory naming tip**: Hermes Agent discovers plugins by scanning directories in `~/.hermes/plugins/` alphabetically. If you keep backup copies (such as `antigravity-subscription-directsdk.backup`), place them outside `~/.hermes/plugins/` so a later-sorting directory does not override the active plugin.
 
 ---
