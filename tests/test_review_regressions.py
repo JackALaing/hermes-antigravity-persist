@@ -94,7 +94,9 @@ class DeliveryRegressionTests(unittest.TestCase):
         self.assertIsNotNone(sample)
         assert sample is not None
         self.assertEqual(sample.input_tokens, 196651)
-        self.assertEqual(chunks[-1].usage.prompt_tokens, 96651)
+        # prompt_tokens includes cache reads: Hermes subtracts cached_tokens itself.
+        self.assertEqual(chunks[-1].usage.prompt_tokens, 196651)
+        self.assertEqual(chunks[-1].usage.prompt_tokens_details.cached_tokens, 100000)
 
     def test_no_watch_means_delta_does_not_contaminate(self):
         watch = DeliveryWatch()
