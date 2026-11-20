@@ -43,7 +43,8 @@ logger = logging.getLogger(__name__)
 # persist.py), so the prompt agy receives per turn is a delta, not the whole
 # history: the old 75,000-token single-turn cap (issue #49) no longer bounds
 # the conversation. Every stdin write is held under agy's 180,000-byte limit
-# instead, and the plugin refreshes its agy conversation at 360,000 tokens.
+# instead, and the plugin refreshes its agy conversation at 360,000 tokens
+# (ANTIGRAVITY_REFRESH_SIZE_TOKENS), rebuilding at most ~200,000.
 # Hermes compaction still governs the history it keeps.
 _GEMINI_DECLARED_CONTEXT = 1_000_000
 _DEFAULT_CONTEXT_LENGTH = 239_000

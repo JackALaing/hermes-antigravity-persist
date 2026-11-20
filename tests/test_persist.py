@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -10,6 +11,7 @@ import textwrap
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import persist
 from persist import (
@@ -101,6 +103,12 @@ class DecideTests(unittest.TestCase):
                 self.assertFalse(d.resume)
                 self.assertEqual(d.reason, reason)
 
+    def test_refresh_threshold_is_configurable(self):
+        record = _record(REPLY, agy_size_tokens=150_000)
+        self.assertTrue(self._decide(record).resume)
+        with patch.dict(os.environ, {"ANTIGRAVITY_REFRESH_SIZE_TOKENS": "100000"}):
+            self.assertEqual(self._decide(record).reason, "conversation size")
+
     def test_effort_change_alone_resumes(self):
         self.assertTrue(self._decide(_record(REPLY, effort="high")).resume)
 
@@ -142,42 +150,108 @@ def _big_history(n, size, char="x"):
 
 
 class PackingTests(unittest.TestCase):
+    def setUp(self):
+        env = patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for name in ("ANTIGRAVITY_REFRESH_MAX_TOKENS", "ANTIGRAVITY_REFRESH_SIZE_TOKENS"):
+            os.environ.pop(name, None)
+
+    def _assert_well_formed(self, out):
+        n = len(out)
+        for k, payload in enumerate(out, start=1):
+            self.assertLess(utf8_len(payload), MAX_STDIN_BYTES)
+            if k < n:
+                self.assertTrue(payload.startswith(f"[CONTEXT ONLY - PART {k} OF {n}"), payload[:60])
+                self.assertIn("Reply with exactly: ACK", payload)
+            else:
+                self.assertTrue(payload.startswith(f"[PART {n} OF {n}."), payload[:60])
+
     def test_small_history_is_one_message_without_seed(self):
         out = pack_refresh(HISTORY + [{"role": "user", "content": "hi"}], model="m", tools=TOOLS,
                            tool_choice=None)
         self.assertEqual(len(out), 1)
 
-    def test_large_history_packs_two_messages_under_limit_multibyte(self):
-        for char in ("x", "é", "日"):
+    def test_large_history_grows_into_as_many_seeds_as_needed_multibyte(self):
+        # ~400-600 KB of history, under the default token cap: nothing dropped.
+        for char, size in (("x", 2000), ("é", 1000), ("日", 700)):
             with self.subTest(char=char):
-                msgs = _big_history(400, 2000, char) + [{"role": "user", "content": "LATEST ASK"}]
+                msgs = _big_history(100, size, char) + [{"role": "user", "content": "LATEST ASK"}]
                 out = pack_refresh(msgs, model="m", tools=TOOLS, tool_choice=None)
-                self.assertEqual(len(out), 2)
-                for payload in out:
-                    self.assertLess(utf8_len(payload), MAX_STDIN_BYTES)
-                self.assertTrue(out[0].startswith("[CONTEXT ONLY - PART 1 OF 2"))
-                self.assertIn("Reply with exactly: ACK", out[0])
-                self.assertIn("earlier messages omitted]", out[0])
+                self.assertGreater(len(out), 2)
+                self._assert_well_formed(out)
+                self.assertNotIn("omitted]", "".join(out))
                 self.assertIn("You are Hermes.", out[0])
-                self.assertIn("LATEST ASK", out[1])
-                self.assertIn("answer 399", out[1])
+                for payload in out[1:]:
+                    self.assertNotIn("You are Hermes.", payload)
+                self.assertIn("LATEST ASK", out[-1])
+                for payload in out[:-1]:
+                    self.assertNotIn("LATEST ASK", payload)
+                joined = "\n".join(out)
+                markers = [f"question {i} " for i in range(100)] + [f"answer {i} " for i in range(100)]
+                for marker in markers:
+                    self.assertEqual(joined.count(marker), 1, marker)
+                order = [joined.index(f"{kind} {i} ") for i in range(100) for kind in ("question", "answer")]
+                self.assertEqual(order, sorted(order))
 
-    def test_active_tool_loop_stays_intact(self):
-        msgs = _big_history(300, 2000)
+    def test_history_over_the_token_cap_drops_oldest_with_a_warning(self):
+        msgs = _big_history(400, 2000) + [{"role": "user", "content": "LATEST ASK"}]
+        with self.assertLogs("persist", level="WARNING") as logs:
+            out = pack_refresh(msgs, model="m", tools=TOOLS, tool_choice=None)
+        self._assert_well_formed(out)
+        total = sum(persist.estimate_tokens(p) for p in out)
+        self.assertLessEqual(total, persist.REFRESH_MAX_TOKENS)
+        self.assertGreater(total, persist.REFRESH_MAX_TOKENS * 0.9, "the cap is used, not trimmed far below")
+        joined = "\n".join(out)
+        self.assertNotIn("question 0 ", joined)
+        self.assertIn("answer 399 ", joined)
+        marker = re.search(r"\[(\d+) earlier messages omitted\]", out[0])
+        self.assertIsNotNone(marker)
+        dropped = int(marker.group(1))
+        self.assertIn(f"question {dropped // 2} " if dropped % 2 == 0 else f"answer {dropped // 2} ", joined)
+        message = "\n".join(logs.output)
+        self.assertIn(f"dropped the {dropped} oldest message(s)", message)
+        self.assertRegex(message, r"~\d+ estimated tokens")
+
+    def test_cap_is_configurable_and_clamped_below_the_refresh_threshold(self):
+        msgs = _big_history(100, 2000) + [{"role": "user", "content": "LATEST ASK"}]
+        os.environ["ANTIGRAVITY_REFRESH_MAX_TOKENS"] = "60000"
+        out = pack_refresh(msgs, model="m", tools=TOOLS, tool_choice=None)
+        self._assert_well_formed(out)
+        self.assertLessEqual(sum(persist.estimate_tokens(p) for p in out), 60_000)
+        self.assertIn("earlier messages omitted]", out[0])
+        os.environ["ANTIGRAVITY_REFRESH_SIZE_TOKENS"] = "100000"
+        os.environ["ANTIGRAVITY_REFRESH_MAX_TOKENS"] = "500000"
+        with self.assertLogs("persist", level="WARNING"):
+            self.assertEqual(persist.refresh_max_tokens(), 75_000)
+        os.environ["ANTIGRAVITY_REFRESH_MAX_TOKENS"] = "junk"
+        with self.assertLogs("persist", level="WARNING"):
+            self.assertEqual(persist.refresh_max_tokens(), 75_000)  # default 200k, clamped
+
+    def test_cap_alone_forcing_a_split_still_sends_one_message_when_it_fits(self):
+        msgs = _big_history(20, 2000) + [{"role": "user", "content": "LATEST ASK"}]
+        out = pack_refresh(msgs, model="m", tools=TOOLS, tool_choice=None, max_tokens=5000)
+        self.assertEqual(len(out), 1)
+        self.assertIn("earlier messages omitted]", out[0])
+        self.assertIn("LATEST ASK", out[0])
+        self.assertLessEqual(persist.estimate_tokens(out[0]), 5000)
+
+    def test_active_tool_loop_stays_intact_in_the_final_part(self):
+        msgs = _big_history(100, 2000)
         msgs.append({"role": "user", "content": "LOOP REQUEST"})
         for i in range(6):
             msgs.append({"role": "assistant", "content": "",
                          "tool_calls": [_call(f"t{i}", "terminal", json.dumps({"n": i}))]})
             msgs.append({"role": "tool", "tool_call_id": f"t{i}", "content": f"RESULT-{i} " + "r" * 15000})
         out = pack_refresh(msgs, model="m", tools=TOOLS, tool_choice=None)
-        self.assertEqual(len(out), 2)
-        joined = "\n".join(out)
-        self.assertIn("LOOP REQUEST", joined)
+        self.assertGreater(len(out), 2)
+        self._assert_well_formed(out)
+        self.assertIn("LOOP REQUEST", out[-1])
         for i in range(6):
-            self.assertIn(f"RESULT-{i} ", joined)
-        positions = [joined.index(f"RESULT-{i} ") for i in range(6)]
+            self.assertIn(f"RESULT-{i} ", out[-1])
+        positions = [out[-1].index(f"RESULT-{i} ") for i in range(6)]
         self.assertEqual(positions, sorted(positions))
-        self.assertIn("USER REQUEST THIS TOOL LOOP IS SERVING", out[1])
+        self.assertIn("USER REQUEST THIS TOOL LOOP IS SERVING", out[-1])
 
     def test_oversized_prefix_raises(self):
         msgs = [{"role": "system", "content": "s" * 175_000}, {"role": "user", "content": "hi"}]

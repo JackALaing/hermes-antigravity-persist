@@ -331,7 +331,7 @@ class PersistentSessionTests(unittest.TestCase):
         self.assertEqual(len(worker.received), 2, "persistent worker untouched")
 
     # -- packing, seeds and the byte guard ---------------------------------
-    def test_large_refresh_sends_seed_internally_and_streams_only_the_answer(self):
+    def test_large_refresh_sends_seeds_internally_and_streams_only_the_answer(self):
         client = self._client()
         history = [{"role": "system", "content": "SYS"}]
         for i in range(120):
@@ -344,16 +344,46 @@ class PersistentSessionTests(unittest.TestCase):
         self.assertEqual(text, "the real answer")
         self.assertNotIn("ACK", text)
         proc = self.world.procs[0]
-        self.assertEqual(len(proc.received), 2)
-        for payload in proc.received:
+        n = len(proc.received)
+        self.assertGreater(n, 2, "a ~720 KB history grows into several seeds")
+        for k, payload in enumerate(proc.received, start=1):
             self.assertLess(persist.utf8_len(payload), persist.MAX_STDIN_BYTES)
-        self.assertTrue(proc.received[0].startswith("[CONTEXT ONLY - PART 1 OF 2"))
+            if k < n:
+                self.assertTrue(payload.startswith(f"[CONTEXT ONLY - PART {k} OF {n}"))
+        self.assertIn("FINAL ASK", proc.received[-1])
+        joined = "".join(proc.received)
+        self.assertIn("u0 ", joined)
+        self.assertIn("a119 ", joined)
         record = self._record()
         self.assertGreater(record["seed_tokens_total"], 0)
-        # Usage is the real turn's step usage only (2nd message on this conversation).
+        # Usage is the real turn's step usage only (n-th message on this conversation).
         usage = [c for c in chunks if getattr(c, "usage", None)][-1].usage
-        self.assertEqual(usage.prompt_tokens, 200 + 2000)
+        self.assertEqual(usage.prompt_tokens, 100 * n + 1000 * n)
         self.assertEqual(usage.completion_tokens, 7)
+
+    def test_each_seed_and_the_real_turn_get_the_full_timeout(self):
+        client = self._client()
+        history = []
+        for i in range(120):
+            history += [{"role": "user", "content": f"u{i} " + "x" * 3000},
+                        {"role": "assistant", "content": f"a{i} " + "x" * 3000}]
+        history.append({"role": "user", "content": "FINAL"})
+        clock = [1000.0]
+        consumed = []
+        original = session.PersistentTurn.consume_seed
+
+        def slow_seed(turn, pending, deadline):
+            consumed.append(deadline - clock[0])
+            original(turn, pending, deadline)
+            clock[0] += 50.0  # each ACK takes 50s of a 60s timeout
+
+        with patch("session.time.monotonic", side_effect=lambda: clock[0]), \
+                patch.object(session.PersistentTurn, "consume_seed", slow_seed):
+            client.chat.completions.create(model=MODEL, messages=history, tools=TOOLS, timeout=60,
+                                           _agy_cache_scope=SCOPE, _agy_write_origin="assistant_tool")
+        self.assertGreater(len(consumed), 1)
+        self.assertTrue(all(budget == 60.0 for budget in consumed), consumed)
+        self.assertFalse(self._record()["needs_refresh"])
 
     def test_seed_advances_usage_baseline_for_result_usage_fallback(self):
         client = self._client()
@@ -364,10 +394,11 @@ class PersistentSessionTests(unittest.TestCase):
                         {"role": "assistant", "content": f"a{i} " + "x" * 3000}]
         history.append({"role": "user", "content": "FINAL"})
         completion = self._create(client, history)
-        self.assertEqual(len(self.world.procs[0].received), 2)
-        # result.usage after the turn is cumulative (seed 100 + turn 200);
-        # only the real turn's increment is reported.
-        self.assertEqual(completion.usage.prompt_tokens, 200 + 2000)
+        n = len(self.world.procs[0].received)
+        self.assertGreater(n, 2)
+        # result.usage after the turn is cumulative over every seed and the
+        # turn; only the real turn's increment is reported.
+        self.assertEqual(completion.usage.prompt_tokens, 100 * n + 1000 * n)
         self.assertEqual(completion.usage.completion_tokens, 7)
 
     def test_non_ack_seed_aborts_discards_conversation_and_raises(self):

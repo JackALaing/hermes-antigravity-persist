@@ -74,7 +74,16 @@ RECORD_VERSION = 1
 PERSISTENT_ORIGIN = "assistant_tool"
 # Refresh before agy's own conversation grows past this (last step's input
 # plus cache read). Hermes' compaction threshold on these profiles is higher.
+# Override: ANTIGRAVITY_REFRESH_SIZE_TOKENS.
 REFRESH_SIZE_TOKENS = 360_000
+# Estimated size cap of a whole refresh rebuild (every seed plus the final
+# part), kept well below the refresh threshold so a fresh conversation does
+# not land next to it and refresh again a few turns later. History beyond it
+# is dropped oldest first, with a warning. Override:
+# ANTIGRAVITY_REFRESH_MAX_TOKENS. Clamped to REBUILD_MAX_FRACTION of the
+# refresh threshold.
+REFRESH_MAX_TOKENS = 200_000
+REBUILD_MAX_FRACTION = 0.75
 # agy silently truncated stdin messages of ~191,000 bytes and up; 185,000
 # passed. Every write must be strictly below this.
 MAX_STDIN_BYTES = 180_000
@@ -102,6 +111,57 @@ class StdinPayloadTooLarge(RuntimeError):
 
 def utf8_len(text: str) -> int:
     return len(text.encode("utf-8"))
+
+
+try:  # Hermes' own estimator, so the cap and Hermes' compaction agree
+    from agent.model_metadata import estimate_tokens_rough as _estimate_tokens
+except Exception:  # pragma: no cover - outside Hermes
+    _CJK_DENSE_RE = re.compile("[\u1100-\u11ff\u2e80-\u9fff\ua960-\ua97f\uac00-\ud7af\uf900-\ufaff\uff00-\uffef]")
+
+    def _estimate_tokens(text: str) -> int:
+        if not text:
+            return 0
+        if text.isascii():
+            return (len(text) + 3) // 4
+        stripped = _CJK_DENSE_RE.sub("", text)
+        return (len(text) - len(stripped)) + (len(stripped.encode("utf-8", "replace")) + 3) // 4
+
+
+def estimate_tokens(text: str) -> int:
+    """Rough token estimate (Hermes' estimate_tokens_rough)."""
+    return int(_estimate_tokens(text))
+
+
+def _env_tokens(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw.replace("_", ""))
+    except ValueError:
+        value = 0
+    if value <= 0:
+        logger.warning("Ignoring invalid %s=%r; using %d", name, raw, default)
+        return default
+    return value
+
+
+def refresh_size_tokens() -> int:
+    """agy conversation size (tokens) that triggers a refresh."""
+    return _env_tokens("ANTIGRAVITY_REFRESH_SIZE_TOKENS", REFRESH_SIZE_TOKENS)
+
+
+def refresh_max_tokens() -> int:
+    """Estimated-token cap on one refresh rebuild, well below the threshold."""
+    cap = _env_tokens("ANTIGRAVITY_REFRESH_MAX_TOKENS", REFRESH_MAX_TOKENS)
+    ceiling = int(refresh_size_tokens() * REBUILD_MAX_FRACTION)
+    if cap > ceiling:
+        logger.warning(
+            "Antigravity refresh rebuild cap %d tokens is too close to the %d-token refresh "
+            "threshold; using %d", cap, refresh_size_tokens(), ceiling,
+        )
+        return ceiling
+    return cap
 
 
 def check_stdin_bytes(content: str) -> None:
@@ -418,7 +478,7 @@ def decide(
         return Decision(False, "model changed")
     if record.get("tools_hash") != tools_hash:
         return Decision(False, "tools changed")
-    if int(record.get("agy_size_tokens") or 0) > REFRESH_SIZE_TOKENS:
+    if int(record.get("agy_size_tokens") or 0) > refresh_size_tokens():
         return Decision(False, "conversation size")
     index = last_assistant_index(messages)
     if index is None or reply_fingerprint(messages[index]) != record.get("last_reply_fp"):
@@ -538,6 +598,46 @@ def _require_active(omitted: int, older_count: int) -> None:
         )
 
 
+def _fill_forward(entries: list[str], capacity: int, base: int) -> list[str]:
+    """Move the oldest entries that fit (contiguously) off ``entries``."""
+    taken: list[str] = []
+    size = base
+    while entries:
+        add = utf8_len(entries[0]) + 2
+        if size + add > capacity:
+            break
+        taken.append(entries.pop(0))
+        size += add
+    return taken
+
+
+def _cap_history(older: list[str], fixed_tokens: int, cap: int) -> tuple[list[str], int, int]:
+    """Keep the newest older entries that fit the token cap.
+
+    Returns (kept entries, omitted message count, omitted estimated tokens).
+    """
+    budget = cap - fixed_tokens
+    kept_from = len(older)
+    used = 0
+    for index in range(len(older) - 1, -1, -1):
+        tokens = estimate_tokens(older[index])
+        if used + tokens > budget:
+            break
+        used += tokens
+        kept_from = index
+    dropped = older[:kept_from]
+    return older[kept_from:], len(dropped), sum(estimate_tokens(e) for e in dropped)
+
+
+def _single_message(prefix: list[str], marker: list[str], entries: list[str], closing: list[str]) -> str:
+    sections = list(prefix)
+    transcript = marker + entries
+    if transcript:
+        sections.append("Conversation transcript:\n\n" + "\n\n".join(transcript))
+    sections.extend(closing)
+    return _join(_apply_media_viewing_protocol(sections))
+
+
 def pack_refresh(
     messages: Sequence[dict[str, Any]],
     *,
@@ -545,51 +645,97 @@ def pack_refresh(
     tools: list[dict[str, Any]] | None,
     tool_choice: Any,
     media_sink: Optional[set] = None,
-    max_messages: int = 2,
+    max_messages: int | None = None,
+    max_tokens: int | None = None,
 ) -> list[str]:
-    """Pack a full history into at most ``max_messages`` stdin messages.
+    """Pack a full history into stdin messages for a fresh agy conversation.
 
-    One message when the canonical full prompt fits. Otherwise the last
-    message holds the latest request and its whole tool loop, filled
-    backwards with the newest history; the first holds the static prefix and
-    the older history that fits behind it, and the oldest messages beyond
-    that are dropped behind an "N earlier messages omitted" marker. With two
-    messages the first is a context-only seed answered with ACK.
+    One message when the canonical full prompt fits. Otherwise as many
+    context-only seeds (each answered with ACK) as the history needs, then a
+    final part. The final part carries the latest request and its whole tool
+    loop, filled backwards with the newest history; the first seed carries
+    the static prefix; the seeds between carry the rest of the history in
+    order. Every message stays under agy's stdin byte limit.
+
+    The whole rebuild is capped at ``max_tokens`` estimated tokens (default
+    ``refresh_max_tokens()``). Only history beyond the cap is dropped, oldest
+    first, behind an "N earlier messages omitted" marker, with a warning.
+
+    ``max_messages=1`` (one-shot) instead keeps the newest history that fits
+    one message and omits the rest.
     """
     full = _format_messages_as_prompt(
         list(messages), model=model, tools=tools, tool_choice=tool_choice, media_sink=media_sink
     )
     prefix = _prefix_sections(messages, tools, tool_choice, media_sink)
-    if utf8_len(full) < MAX_STDIN_BYTES:
+    cap = refresh_max_tokens() if max_tokens is None else max_tokens
+    if utf8_len(full) < MAX_STDIN_BYTES and (max_messages == 1 or estimate_tokens(full) <= cap):
         return [full]
 
     _history, older, active, closing = _split_history(messages, media_sink)
     capacity = MAX_STDIN_BYTES - _HEADER_RESERVE
-    entries = _presplit(older + active, capacity // 2)
-    older_count = len(entries) - len(_presplit(active, capacity // 2))
-    marker_reserve = utf8_len(_omission_marker(len(entries))) + 64
 
-    if max_messages <= 1:
+    if max_messages is not None and max_messages <= 1:
+        entries = _presplit(older + active, capacity // 2)
+        older_count = len(entries) - len(_presplit(active, capacity // 2))
+        marker_reserve = utf8_len(_omission_marker(len(entries))) + 64
         base = _joined_len(prefix) + _joined_len(closing) + marker_reserve + 64
         tail = _fill_from_end(entries, capacity, base)
         _require_active(len(entries), older_count)
-        sections = list(prefix)
-        transcript = ([_omission_marker(len(entries))] if entries else []) + tail
-        if transcript:
-            sections.append("Conversation transcript:\n\n" + "\n\n".join(transcript))
-        sections.extend(closing)
-        return [_join(_apply_media_viewing_protocol(sections))]
+        return [_single_message(prefix, [_omission_marker(len(entries))] if entries else [], tail, closing)]
 
+    # Token cap over the whole rebuild: the prefix, the request and its active
+    # loop are mandatory; older history fills the rest, newest first.
+    fixed = (estimate_tokens(_join(prefix)) + estimate_tokens(_join(closing))
+             + sum(estimate_tokens(e) for e in active) + 256)
+    kept, omitted, omitted_tokens = _cap_history(older, fixed, cap)
+    if omitted:
+        logger.warning(
+            "Antigravity refresh rebuild exceeds the %d-token cap: dropped the %d oldest "
+            "message(s) (~%d estimated tokens); kept %d", cap, omitted, omitted_tokens, len(kept),
+        )
+    marker = [_omission_marker(omitted)] if omitted else []
+
+    older_pieces = _presplit(kept, capacity // 2)
+    active_pieces = _presplit(active, capacity // 2)
+    entries = older_pieces + active_pieces
     final_entries = _fill_from_end(entries, capacity, _joined_len(closing) + 64)
-    first_entries = _fill_from_end(entries, capacity, _joined_len(prefix) + marker_reserve + 64)
-    _require_active(len(entries), older_count)
-    seed_sections = [SEED_HEADER.format(k=1, n=2), *prefix]
-    transcript = ([_omission_marker(len(entries))] if entries else []) + first_entries
-    if transcript:
-        seed_sections.append("Conversation transcript (earlier part):\n\n" + "\n\n".join(transcript))
-    seed = _join(seed_sections)
-    final = _final_message(FINAL_HEADER.format(n=2), final_entries, closing)
-    return [seed, final]
+    _require_active(len(entries), len(older_pieces))  # the active loop must sit in the final part
+
+    if not entries and _joined_len(prefix) + _joined_len(marker) + _joined_len(final_entries) \
+            + _joined_len(closing) + 256 < capacity:
+        # Only the cap forced a split: everything that is left fits one message.
+        return [_single_message(prefix, marker, final_entries, closing)]
+
+    chunks: list[list[str]] = [
+        _fill_forward(entries, capacity, _joined_len(prefix) + _joined_len(marker) + 128)
+    ]
+    while entries:
+        chunk = _fill_forward(entries, capacity, 128)
+        if not chunk:  # cannot happen after _presplit; never loop forever
+            raise StdinPayloadTooLarge("Antigravity prompt: history entry too large to split.")
+        chunks.append(chunk)
+
+    total = len(chunks) + 1
+    payloads = []
+    for k, chunk in enumerate(chunks, start=1):
+        sections = [SEED_HEADER.format(k=k, n=total)]
+        transcript = list(chunk)
+        if k == 1:
+            sections.extend(prefix)
+            transcript = marker + transcript
+            label = "Conversation transcript (earlier part):"
+        else:
+            label = "Conversation transcript (continued):"
+        if transcript:
+            sections.append(label + "\n\n" + "\n\n".join(transcript))
+        payloads.append(_join(sections))
+    payloads.append(_final_message(FINAL_HEADER.format(n=total), final_entries, closing))
+    logger.info(
+        "Antigravity refresh rebuild: %d message(s), ~%d estimated tokens, %d history message(s) omitted",
+        len(payloads), sum(estimate_tokens(p) for p in payloads), omitted,
+    )
+    return payloads
 
 
 def pack_oneshot(

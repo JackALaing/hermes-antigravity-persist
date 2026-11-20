@@ -9,8 +9,9 @@ One turn:
    check the init event names that conversation (otherwise refresh). Send
    only the messages after the last reply.
 4. Refresh: spawn a new conversation in the persistent home and send the
-   packed history; a context-only first part is consumed here and must be
-   acknowledged with ACK. It never reaches Hermes.
+   packed history: as many context-only parts as it needs, each consumed
+   here and acknowledged with ACK (they never reach Hermes), then the final
+   part carrying the latest request and its active tool loop.
 5. Hand Hermes an ``AntigravityStream`` whose "client" is the turn object
    below. On success the stream calls ``_on_worker_turn_success`` before the
    finish chunk: the record is written and the lock released. Any failure,
@@ -548,8 +549,11 @@ def _start_turn(turn: PersistentTurn, store: PersistStore, key: str, record: dic
         turn.spawn(None)
         pending = turn.write(payloads[0], deadline)
 
+    # Each context-only part gets the full timeout, and so does the real turn
+    # after the last one: a long rebuild must not starve the answer.
     for payload in payloads[1:]:
         turn.consume_seed(pending, deadline)
+        deadline = time.monotonic() + timeout
         pending = turn.write(payload, deadline)
 
     worker = turn.worker
