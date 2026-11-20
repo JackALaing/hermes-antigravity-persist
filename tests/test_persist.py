@@ -275,6 +275,116 @@ class PackingTests(unittest.TestCase):
         self.assertIn("earlier messages omitted]", out)
 
 
+def _tool_loop(n, chars, request="Refactor the repo please.", unit="y = f(x)\n"):
+    loop: list[dict] = [{"role": "user", "content": request}]
+    for i in range(n):
+        loop.append({"role": "assistant", "content": "",
+                     "tool_calls": [_call(f"c{i}", "terminal", json.dumps({"command": f"cat f{i}.py"}))]})
+        loop.append({"role": "tool", "tool_call_id": f"c{i}", "content": f"OUT-{i} " + unit * (chars // len(unit))})
+    return loop
+
+
+class SummaryAndLoopPackingTests(unittest.TestCase):
+    """Review B1 (summaries survive the cap), 4 (long active loops) and 5 (one-shot warning)."""
+
+    def setUp(self):
+        env = patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for name in ("ANTIGRAVITY_REFRESH_MAX_TOKENS", "ANTIGRAVITY_REFRESH_SIZE_TOKENS"):
+            os.environ.pop(name, None)
+
+    def test_summary_markers_are_recognised(self):
+        summaries = [
+            "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted into the summary below.",
+            "[PRIOR CONTEXT — for reference only; not a new message]\nstuff",
+            "[Current user objective preserved from compacted history]\nfix the build",
+            "intro\n[Recent Summary (d0, node 12)]\nthe deploy key lives in vault B",
+            "[Session Arc Summary (d1, node 3)]\n...",
+            "body\n--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---",
+        ]
+        for text in summaries:
+            with self.subTest(text[:30]):
+                self.assertTrue(persist.is_summary_message({"role": "user", "content": text}))
+        self.assertTrue(persist.is_summary_message(
+            {"role": "assistant", "content": [{"type": "text", "text": summaries[0]}]}))
+        self.assertFalse(persist.is_summary_message({"role": "user", "content": "please summarize this"}))
+        self.assertFalse(persist.is_summary_message({"role": "tool", "content": summaries[0]}))
+
+    def _capped_history(self, summary_text):
+        msgs = [{"role": "system", "content": "SYSTEM-SENTINEL"},
+                {"role": "user", "content": summary_text}, {"role": "assistant", "content": "ok"}]
+        msgs += _big_history(400, 2000)[1:]
+        msgs.append({"role": "user", "content": "LATEST ASK"})
+        return msgs
+
+    def test_capped_refresh_keeps_native_and_lcm_summaries_and_drops_oldest_ordinary(self):
+        for summary in (
+            "[CONTEXT COMPACTION — REFERENCE ONLY] SUMMARY-FACT-ZETA: the key is in vault B.",
+            "[Current user objective preserved from compacted history]\nobjective\n\n"
+            "[Recent Summary (d0, node 1)]\nSUMMARY-FACT-ZETA: the key is in vault B.",
+        ):
+            with self.subTest(summary[:20]), self.assertLogs("persist", level="WARNING") as logs:
+                out = pack_refresh(self._capped_history(summary), model="m", tools=TOOLS, tool_choice=None)
+                self.assertGreater(len(out), 2)
+                self.assertIn("SYSTEM-SENTINEL", out[0])
+                self.assertIn("SUMMARY-FACT-ZETA", out[0], "summary sits with the prefix")
+                head = out[0]
+                self.assertLess(head.index("SYSTEM-SENTINEL"), head.index("SUMMARY-FACT-ZETA"))
+                marker = re.search(r"\[(\d+) earlier messages omitted\]", head)
+                assert marker is not None
+                self.assertLess(head.index("SUMMARY-FACT-ZETA"), marker.start(),
+                                "the omission marker follows the summary")
+                joined = "\n".join(out)
+                self.assertNotIn("question 0 ", joined)
+                self.assertIn("answer 399 ", joined)
+                self.assertIn("LATEST ASK", out[-1])
+                self.assertLessEqual(sum(persist.estimate_tokens(p) for p in out), persist.REFRESH_MAX_TOKENS)
+                self.assertIn("1 summary message(s)", "\n".join(logs.output))
+
+    def test_oneshot_keeps_the_summary_and_warns_about_omitted_history(self):
+        msgs = self._capped_history("[CONTEXT COMPACTION] SUMMARY-FACT-ZETA")
+        with self.assertLogs("persist", level="WARNING") as logs:
+            out = pack_oneshot(msgs, model="m", tools=TOOLS, tool_choice=None)
+        self.assertIn("SUMMARY-FACT-ZETA", out)
+        self.assertIn("earlier messages omitted]", out)
+        self.assertLess(out.index("SUMMARY-FACT-ZETA"), out.index("earlier messages omitted]"))
+        self.assertIn("one-shot prompt omits", "\n".join(logs.output))
+
+    def test_oneshot_that_fits_logs_nothing(self):
+        with self.assertNoLogs("persist", level="WARNING"):
+            pack_oneshot(_big_history(5, 100) + [{"role": "user", "content": "hi"}], model="m",
+                         tools=TOOLS, tool_choice=None)
+
+    def test_long_active_tool_loop_with_production_prefix_refreshes(self):
+        # The review's probe: a 118 KB system prompt and 16-40 tool results of
+        # 12K chars raised StdinPayloadTooLarge before old-output pruning.
+        system = {"role": "system", "content": ("Hermes SOUL and skills. " * 4800)[:118_000]}
+        for steps in (16, 40):
+            with self.subTest(steps=steps):
+                msgs = [system, *_tool_loop(steps, 12_000)]
+                out = pack_refresh(msgs, model="m", tools=TOOLS, tool_choice=None)
+                for payload in out:
+                    self.assertLess(utf8_len(payload), MAX_STDIN_BYTES)
+                final = out[-1]
+                self.assertIn("Refactor the repo please.", final)
+                self.assertIn(f"OUT-{steps - 1} ", final, "the newest tool result is kept")
+                self.assertIn(f"OUT-{steps - 1} " + "y = f(x)\n" * 50, final, "and in full")
+                self.assertIn("[... tool output truncated:", final, "older output is a stub")
+
+    def test_loop_pruning_steps_down_until_it_fits_and_warns(self):
+        # 19K-char multibyte results (57 KB each, under the 20K-char cap):
+        # neither 8 nor 4 retained results fit one message; 1 does.
+        system = {"role": "system", "content": "s" * 60_000}
+        msgs = [system, *_tool_loop(10, 19_000, unit="日")]
+        with self.assertLogs("persist", level="WARNING") as logs:
+            out = pack_refresh(msgs, model="m", tools=TOOLS, tool_choice=None)
+        self.assertIn("OUT-9 ", out[-1])
+        self.assertRegex("\n".join(logs.output), r"only fits with the 1 newest tool result")
+        for payload in out:
+            self.assertLess(utf8_len(payload), MAX_STDIN_BYTES)
+
+
 class ByteGuardTests(unittest.TestCase):
     def test_guard_rejects_at_limit_and_counts_bytes_not_chars(self):
         check_stdin_bytes("a" * (MAX_STDIN_BYTES - 1))

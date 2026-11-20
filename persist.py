@@ -554,21 +554,80 @@ def _final_message(header: str | None, entries: list[str], closing: list[str]) -
     return _join(_apply_media_viewing_protocol([s for s in sections if s]))
 
 
-def _split_history(messages: Sequence[dict[str, Any]], media_sink: Optional[set]):
-    """(prefix sections, older entries, active entries, closing sections).
+# Messages that carry a compactor's summary or preserved objective. Both
+# compactors put them at the oldest end of the history (native: a
+# "[CONTEXT COMPACTION ..." handoff row, or a merged "[PRIOR CONTEXT ..."
+# carrier; LCM-X: summary blocks and the preserved objective in the first user
+# message), which is exactly what an oldest-first cap would drop first. They
+# are mandatory in a rebuild, kept right after the static prefix. Hermes
+# strips its private ``_compressed_summary`` key before providers see the
+# request, so detection is by the markers the compactors write.
+_SUMMARY_PREFIXES = (
+    "[CONTEXT COMPACTION",
+    "[PRIOR CONTEXT",
+    "[Current user objective preserved from compacted history]",
+    "[Your active task list was preserved",
+    "[Planning state preserved",
+)
+_SUMMARY_MARKER_RE = re.compile(
+    r"--- END OF CONTEXT SUMMARY"
+    r"|\[(?:Recent|Session Arc|Durable|Depth-\d+) Summary \(d\d+, node \d+\)\]"
+)
 
-    The active part is the latest user request plus its whole tool loop:
-    everything from the last real user message on. It must survive packing.
+
+def is_summary_message(message: Any) -> bool:
+    """A compaction summary / preserved-objective message (kept in every rebuild)."""
+    if _role(message) not in ("user", "assistant"):
+        return False
+    text = _flatten_content(message.get("content")).lstrip()
+    return text.startswith(_SUMMARY_PREFIXES) or bool(_SUMMARY_MARKER_RE.search(text))
+
+
+# How many of the newest tool results keep their full output in a split
+# rebuild, tried in order until the active tool loop fits its message. The
+# first step matches the canonical one-message prompt (prompt.py keeps the 8
+# newest tool results and cuts older ones to a stub).
+TOOL_RETENTION_STEPS = (8, 4, 1, 0)
+_PRUNED_TOOL_MAX_CHARS = 300
+
+
+def _prune_tool_results(history: list[dict[str, Any]], keep: int) -> list[dict[str, Any]]:
+    """Cut every tool result but the ``keep`` newest to a stub, as prompt.py does."""
+    tool_indices = [i for i, m in enumerate(history) if _role(m) == "tool"]
+    retained = set(tool_indices[-keep:]) if keep > 0 else set()
+    out = []
+    for index, message in enumerate(history):
+        if _role(message) == "tool" and index not in retained:
+            text = _flatten_content(message.get("content"))
+            if len(text) > _PRUNED_TOOL_MAX_CHARS:
+                message = dict(message, content=(
+                    text[:200] + f"\n[... tool output truncated: {len(text)} chars ...]\n" + text[-100:]
+                ))
+        out.append(message)
+    return out
+
+
+def _split_history(history: list[dict[str, Any]], media_sink: Optional[set]):
+    """(summary entries, older entries, active entries, closing sections).
+
+    ``history`` holds the non-system messages. The active part is the latest
+    user request plus its whole tool loop: everything from the last real user
+    message on. It must survive packing, and so must the summary messages
+    before it (``is_summary_message``).
     """
-    history = [m for m in messages if isinstance(m, dict) and _role(m) != "system"]
     loop_start = len(history) - 1 if history else 0
     for index in range(len(history) - 1, -1, -1):
         if _role(history[index]) == "user" and not _is_recovery_nudge(history[index]):
             loop_start = index
             break
-    older = [e for e in (_render_transcript_entry(m) for m in history[:loop_start]) if e]
+    summaries: list[str] = []
+    older: list[str] = []
+    for message in history[:loop_start]:
+        entry = _render_transcript_entry(message)
+        if entry:
+            (summaries if is_summary_message(message) else older).append(entry)
     active, closing = _delta_parts(history[loop_start:], _latest_user_text(history), media_sink)
-    return history, older, active, closing
+    return summaries, older, active, closing
 
 
 def _prefix_sections(messages, tools, tool_choice, media_sink) -> list[str]:
@@ -590,9 +649,13 @@ def _omission_marker(count: int) -> str:
     return f"[{count} earlier message{'s' if count != 1 else ''} omitted]"
 
 
+class _ActiveLoopTooLarge(StdinPayloadTooLarge):
+    """The request and its active tool loop do not fit one message."""
+
+
 def _require_active(omitted: int, older_count: int) -> None:
     if omitted > older_count:
-        raise StdinPayloadTooLarge(
+        raise _ActiveLoopTooLarge(
             "Antigravity prompt: the latest request and its active tool loop alone "
             f"exceed agy's stdin limit of {MAX_STDIN_BYTES:,} bytes per message."
         )
@@ -651,65 +714,117 @@ def pack_refresh(
     """Pack a full history into stdin messages for a fresh agy conversation.
 
     One message when the canonical full prompt fits. Otherwise as many
-    context-only seeds (each answered with ACK) as the history needs, then a
+    context-only seeds (each answered internally) as the history needs, then a
     final part. The final part carries the latest request and its whole tool
     loop, filled backwards with the newest history; the first seed carries
-    the static prefix; the seeds between carry the rest of the history in
-    order. Every message stays under agy's stdin byte limit.
+    the static prefix and any compaction summary; the seeds between carry the
+    rest of the history in order. Every message stays under agy's stdin byte
+    limit.
 
     The whole rebuild is capped at ``max_tokens`` estimated tokens (default
-    ``refresh_max_tokens()``). Only history beyond the cap is dropped, oldest
-    first, behind an "N earlier messages omitted" marker, with a warning.
+    ``refresh_max_tokens()``). The prefix, compaction summaries and the active
+    loop are mandatory; only ordinary history beyond the cap is dropped,
+    oldest first, behind an "N earlier messages omitted" marker, with a
+    warning. Old tool output is cut to a stub as in the canonical prompt, and
+    more of it when the active loop would not fit otherwise
+    (``TOOL_RETENTION_STEPS``).
 
     ``max_messages=1`` (one-shot) instead keeps the newest history that fits
-    one message and omits the rest.
+    one message and omits the rest, with a warning.
     """
     full = _format_messages_as_prompt(
         list(messages), model=model, tools=tools, tool_choice=tool_choice, media_sink=media_sink
     )
     prefix = _prefix_sections(messages, tools, tool_choice, media_sink)
     cap = refresh_max_tokens() if max_tokens is None else max_tokens
-    if utf8_len(full) < MAX_STDIN_BYTES and (max_messages == 1 or estimate_tokens(full) <= cap):
+    single = max_messages is not None and max_messages <= 1
+    if utf8_len(full) < MAX_STDIN_BYTES and (single or estimate_tokens(full) <= cap):
         return [full]
 
-    _history, older, active, closing = _split_history(messages, media_sink)
+    history = [m for m in messages if isinstance(m, dict) and _role(m) != "system"]
+    failure: StdinPayloadTooLarge | None = None
+    for keep in TOOL_RETENTION_STEPS:
+        pruned = _prune_tool_results(history, keep)
+        try:
+            if single:
+                payloads = _pack_single(pruned, prefix, media_sink)
+            else:
+                payloads = _pack_split(pruned, prefix, cap, media_sink)
+        except _ActiveLoopTooLarge as exc:
+            failure = exc
+            continue
+        if keep != TOOL_RETENTION_STEPS[0]:
+            logger.warning(
+                "Antigravity rebuild: the active tool loop only fits with the %d newest tool "
+                "result(s) in full; older tool output was cut to a stub", keep,
+            )
+        return payloads
+    assert failure is not None
+    raise failure
+
+
+def _pack_single(history: list[dict[str, Any]], prefix: list[str], media_sink: Optional[set]) -> list[str]:
+    """One message: prefix, summaries, the newest history that fits, the request."""
+    summaries, older, active, closing = _split_history(history, media_sink)
+    capacity = MAX_STDIN_BYTES - _HEADER_RESERVE
+    summary_pieces = _presplit(summaries, capacity // 2)
+    older_pieces = _presplit(older, capacity // 2)
+    active_pieces = _presplit(active, capacity // 2)
+    marker_reserve = utf8_len(_omission_marker(len(older_pieces) + len(summary_pieces))) + 64
+    base = _joined_len(prefix) + _joined_len(closing) + marker_reserve + 64
+    head: list[str] = []
+    if summary_pieces and base + _joined_len(summary_pieces) + _joined_len(active_pieces) + 4 < capacity:
+        head = summary_pieces
+        base += _joined_len(summary_pieces) + 2
+    else:  # no room to keep them whole: they compete like any old message
+        older_pieces = summary_pieces + older_pieces
+    entries = older_pieces + active_pieces
+    tail = _fill_from_end(entries, capacity, base)
+    _require_active(len(entries), len(older_pieces))
+    marker = [_omission_marker(len(entries))] if entries else []
+    if entries:
+        logger.warning(
+            "Antigravity one-shot prompt omits the %d oldest history piece(s) (~%d estimated tokens) "
+            "to fit agy's %d-byte stdin limit; kept %d", len(entries),
+            sum(estimate_tokens(e) for e in entries), MAX_STDIN_BYTES, len(tail),
+        )
+    return [_single_message(prefix, head + marker, tail, closing)]
+
+
+def _pack_split(history: list[dict[str, Any]], prefix: list[str], cap: int,
+                media_sink: Optional[set]) -> list[str]:
+    summaries, older, active, closing = _split_history(history, media_sink)
     capacity = MAX_STDIN_BYTES - _HEADER_RESERVE
 
-    if max_messages is not None and max_messages <= 1:
-        entries = _presplit(older + active, capacity // 2)
-        older_count = len(entries) - len(_presplit(active, capacity // 2))
-        marker_reserve = utf8_len(_omission_marker(len(entries))) + 64
-        base = _joined_len(prefix) + _joined_len(closing) + marker_reserve + 64
-        tail = _fill_from_end(entries, capacity, base)
-        _require_active(len(entries), older_count)
-        return [_single_message(prefix, [_omission_marker(len(entries))] if entries else [], tail, closing)]
-
-    # Token cap over the whole rebuild: the prefix, the request and its active
-    # loop are mandatory; older history fills the rest, newest first.
+    # Token cap over the whole rebuild: the prefix, the summaries, the request
+    # and its active loop are mandatory; older history fills the rest, newest
+    # first.
     fixed = (estimate_tokens(_join(prefix)) + estimate_tokens(_join(closing))
+             + sum(estimate_tokens(e) for e in summaries)
              + sum(estimate_tokens(e) for e in active) + 256)
     kept, omitted, omitted_tokens = _cap_history(older, fixed, cap)
     if omitted:
         logger.warning(
             "Antigravity refresh rebuild exceeds the %d-token cap: dropped the %d oldest "
-            "message(s) (~%d estimated tokens); kept %d", cap, omitted, omitted_tokens, len(kept),
+            "message(s) (~%d estimated tokens); kept %d and %d summary message(s)",
+            cap, omitted, omitted_tokens, len(kept), len(summaries),
         )
     marker = [_omission_marker(omitted)] if omitted else []
 
+    head_pieces = _presplit(summaries, capacity // 2) + marker
     older_pieces = _presplit(kept, capacity // 2)
     active_pieces = _presplit(active, capacity // 2)
-    entries = older_pieces + active_pieces
+    entries = head_pieces + older_pieces + active_pieces
     final_entries = _fill_from_end(entries, capacity, _joined_len(closing) + 64)
-    _require_active(len(entries), len(older_pieces))  # the active loop must sit in the final part
+    # The active loop must sit in the final part.
+    _require_active(len(entries), len(head_pieces) + len(older_pieces))
 
-    if not entries and _joined_len(prefix) + _joined_len(marker) + _joined_len(final_entries) \
+    if not entries and _joined_len(prefix) + _joined_len(final_entries) \
             + _joined_len(closing) + 256 < capacity:
         # Only the cap forced a split: everything that is left fits one message.
-        return [_single_message(prefix, marker, final_entries, closing)]
+        return [_single_message(prefix, [], final_entries, closing)]
 
-    chunks: list[list[str]] = [
-        _fill_forward(entries, capacity, _joined_len(prefix) + _joined_len(marker) + 128)
-    ]
+    chunks: list[list[str]] = [_fill_forward(entries, capacity, _joined_len(prefix) + 128)]
     while entries:
         chunk = _fill_forward(entries, capacity, 128)
         if not chunk:  # cannot happen after _presplit; never loop forever
@@ -720,15 +835,13 @@ def pack_refresh(
     payloads = []
     for k, chunk in enumerate(chunks, start=1):
         sections = [SEED_HEADER.format(k=k, n=total)]
-        transcript = list(chunk)
         if k == 1:
             sections.extend(prefix)
-            transcript = marker + transcript
             label = "Conversation transcript (earlier part):"
         else:
             label = "Conversation transcript (continued):"
-        if transcript:
-            sections.append(label + "\n\n" + "\n\n".join(transcript))
+        if chunk:
+            sections.append(label + "\n\n" + "\n\n".join(chunk))
         payloads.append(_join(sections))
     payloads.append(_final_message(FINAL_HEADER.format(n=total), final_entries, closing))
     logger.info(
