@@ -930,6 +930,34 @@ def _tool_loop_objective_section(user_text: str) -> str:
     )
 
 
+def _tool_sections(tools: list[dict[str, Any]] | None, tool_choice: Any) -> list[str]:
+    """Prompt sections describing the host's tools and the call protocol."""
+    try:
+        from agent.acp_openai_bridge import render_tool_bridge_sections
+        return list(render_tool_bridge_sections(tools, tool_choice))
+    except Exception:
+        tool_sections = []
+        if tools:
+            tool_sections.append(
+                "Available tools (OpenAI function schema):\n"
+                + json.dumps(tools, ensure_ascii=False)
+            )
+        return tool_sections
+
+
+def _system_section(messages: Sequence[Any], media_sink: Optional[set] = None) -> str:
+    """The SYSTEM INSTRUCTIONS section for the system messages ('' when none)."""
+    system_parts = []
+    for msg in messages:
+        if isinstance(msg, dict) and str(msg.get("role") or "").strip().lower() == "system":
+            rendered = _render_message_content(msg.get("content"), media_sink)
+            if rendered:
+                system_parts.append(rendered)
+    if not system_parts:
+        return ""
+    return "### SYSTEM INSTRUCTIONS (HERMES AGENT):\n" + "\n\n".join(f"System:\n{p}" for p in system_parts)
+
+
 def _format_messages_as_prompt(
     messages: list[dict[str, Any]],
     model: str | None = None,
@@ -938,18 +966,7 @@ def _format_messages_as_prompt(
     media_sink: Optional[set] = None,
 ) -> str:
     """Assemble Hermes message history, system prompt, and tool schemas into a canonical prompt."""
-    try:
-        from agent.acp_openai_bridge import render_tool_bridge_sections
-        tool_sections = render_tool_bridge_sections(tools, tool_choice)
-    except Exception:
-        tool_sections = []
-        if tools:
-            tool_sections.append(
-                "Available tools (OpenAI function schema):\n"
-                + json.dumps(tools, ensure_ascii=False)
-            )
-
-    sections: list[str] = [*_PROMPT_PREAMBLE, *tool_sections]
+    sections: list[str] = [*_PROMPT_PREAMBLE, *_tool_sections(tools, tool_choice)]
 
     valid_messages = [m for m in messages if isinstance(m, dict)]
     last_msg = valid_messages[-1] if valid_messages else None

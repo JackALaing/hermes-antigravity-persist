@@ -1,0 +1,362 @@
+"""Persistent-conversation records, locks, fingerprints, decisions and packing."""
+
+import json
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+import unittest
+from pathlib import Path
+
+import persist
+from persist import (
+    MAX_STDIN_BYTES,
+    ConversationLock,
+    PersistStore,
+    StdinPayloadTooLarge,
+    check_stdin_bytes,
+    decide,
+    pack_oneshot,
+    pack_refresh,
+    reply_fingerprint,
+    split_delta,
+    tools_hash,
+    utf8_len,
+)
+
+REPO = Path(__file__).resolve().parents[1]
+TOOLS = [{"type": "function", "function": {"name": "terminal", "parameters": {"type": "object"}}}]
+
+
+def _call(cid, name, args):
+    return {"id": cid, "type": "function", "function": {"name": name, "arguments": args}}
+
+
+def _record(reply, **over):
+    record = {
+        "version": persist.RECORD_VERSION, "scope_hash": "k", "agy_conversation_id": "conv-1",
+        "last_reply_fp": reply_fingerprint(reply), "model": "m", "effort": "low",
+        "tools_hash": tools_hash(TOOLS), "agy_size_tokens": 1000, "needs_refresh": False,
+    }
+    record.update(over)
+    return record
+
+
+REPLY = {"role": "assistant", "content": "Done. The file is fixed.",
+         "tool_calls": [_call("c3", "terminal", '{"command": "ls", "cwd": "/tmp"}')]}
+HISTORY = [
+    {"role": "system", "content": "sys"},
+    {"role": "user", "content": "fix it"},
+    REPLY,
+]
+
+
+class FingerprintTests(unittest.TestCase):
+    def test_renamed_tool_call_id_still_matches(self):
+        renamed = dict(REPLY, tool_calls=[_call("c3_d2", "terminal", '{"cwd":"/tmp","command":"ls"}')])
+        self.assertEqual(reply_fingerprint(renamed), reply_fingerprint(REPLY))
+
+    def test_reasoning_stripped_reply_still_matches(self):
+        with_think = dict(REPLY, content="<think>let me see\nmore</think>\nDone.   The file is fixed.")
+        self.assertEqual(reply_fingerprint(with_think), reply_fingerprint(REPLY))
+
+    def test_tool_call_frame_in_text_is_ignored(self):
+        framed = dict(REPLY, content='Done. The file is fixed.<tool_call>{"x":1}</tool_call>')
+        self.assertEqual(reply_fingerprint(framed), reply_fingerprint(REPLY))
+
+    def test_different_arguments_do_not_match(self):
+        other = dict(REPLY, tool_calls=[_call("c3", "terminal", '{"command": "pwd", "cwd": "/tmp"}')])
+        self.assertNotEqual(reply_fingerprint(other), reply_fingerprint(REPLY))
+
+
+class DecideTests(unittest.TestCase):
+    def setUp(self):
+        self.th = tools_hash(TOOLS)
+        self.messages = [*HISTORY, {"role": "tool", "tool_call_id": "c3", "content": "ok"}]
+
+    def _decide(self, record, messages=None, model="m", th=None):
+        return decide(record, messages or self.messages, model=model, tools_hash=th or self.th)
+
+    def test_matching_record_resumes_with_only_messages_after_the_reply(self):
+        d = self._decide(_record(REPLY))
+        self.assertTrue(d.resume, d.reason)
+        self.assertEqual(d.delta, [self.messages[-1]])
+
+    def test_each_refresh_trigger(self):
+        cases = {
+            "no record": None,
+            "needs refresh": _record(REPLY, needs_refresh=True),
+            "record version": _record(REPLY, version=0),
+            "no conversation id": _record(REPLY, agy_conversation_id=""),
+            "model changed": _record(REPLY, model="other"),
+            "tools changed": _record(REPLY, tools_hash="x"),
+            "conversation size": _record(REPLY, agy_size_tokens=persist.REFRESH_SIZE_TOKENS + 1),
+        }
+        for reason, record in cases.items():
+            with self.subTest(reason):
+                d = self._decide(record)
+                self.assertFalse(d.resume)
+                self.assertEqual(d.reason, reason)
+
+    def test_effort_change_alone_resumes(self):
+        self.assertTrue(self._decide(_record(REPLY, effort="high")).resume)
+
+    def test_assistant_message_after_ours_refreshes(self):
+        messages = [*self.messages, {"role": "assistant", "content": "fallback answer"},
+                    {"role": "user", "content": "next"}]
+        d = self._decide(_record(REPLY), messages)
+        self.assertEqual((d.resume, d.reason), (False, "fingerprint mismatch"))
+
+    def test_interrupt_placeholder_as_last_assistant_refreshes(self):
+        messages = [*self.messages,
+                    {"role": "assistant", "content": "[interrupt: no assistant output for this turn]"},
+                    {"role": "user", "content": "again"}]
+        self.assertFalse(self._decide(_record(REPLY), messages).resume)
+
+    def test_identical_earlier_reply_does_not_match(self):
+        messages = [{"role": "user", "content": "a"}, REPLY,
+                    {"role": "tool", "tool_call_id": "c3", "content": "ok"},
+                    {"role": "assistant", "content": "something else"},
+                    {"role": "user", "content": "b"}]
+        self.assertFalse(self._decide(_record(REPLY), messages).resume)
+
+    def test_merged_summary_wrapper_refreshes(self):
+        wrapped = dict(REPLY, content="[CONTEXT COMPACTION] summary of earlier turns...\n\n"
+                       + REPLY["content"] + "\n[END OF SUMMARY]")
+        messages = [{"role": "system", "content": "s"}, wrapped, {"role": "user", "content": "go"}]
+        self.assertFalse(self._decide(_record(REPLY), messages).resume)
+
+    def test_no_new_messages_refreshes(self):
+        self.assertEqual(self._decide(_record(REPLY), HISTORY).reason, "empty delta")
+
+
+def _big_history(n, size, char="x"):
+    msgs = [{"role": "system", "content": "You are Hermes."}]
+    for i in range(n):
+        msgs.append({"role": "user", "content": f"question {i} " + char * size})
+        msgs.append({"role": "assistant", "content": f"answer {i} " + char * size})
+    return msgs
+
+
+class PackingTests(unittest.TestCase):
+    def test_small_history_is_one_message_without_seed(self):
+        out = pack_refresh(HISTORY + [{"role": "user", "content": "hi"}], model="m", tools=TOOLS,
+                           tool_choice=None)
+        self.assertEqual(len(out), 1)
+
+    def test_large_history_packs_two_messages_under_limit_multibyte(self):
+        for char in ("x", "é", "日"):
+            with self.subTest(char=char):
+                msgs = _big_history(400, 2000, char) + [{"role": "user", "content": "LATEST ASK"}]
+                out = pack_refresh(msgs, model="m", tools=TOOLS, tool_choice=None)
+                self.assertEqual(len(out), 2)
+                for payload in out:
+                    self.assertLess(utf8_len(payload), MAX_STDIN_BYTES)
+                self.assertTrue(out[0].startswith("[CONTEXT ONLY - PART 1 OF 2"))
+                self.assertIn("Reply with exactly: ACK", out[0])
+                self.assertIn("earlier messages omitted]", out[0])
+                self.assertIn("You are Hermes.", out[0])
+                self.assertIn("LATEST ASK", out[1])
+                self.assertIn("answer 399", out[1])
+
+    def test_active_tool_loop_stays_intact(self):
+        msgs = _big_history(300, 2000)
+        msgs.append({"role": "user", "content": "LOOP REQUEST"})
+        for i in range(6):
+            msgs.append({"role": "assistant", "content": "",
+                         "tool_calls": [_call(f"t{i}", "terminal", json.dumps({"n": i}))]})
+            msgs.append({"role": "tool", "tool_call_id": f"t{i}", "content": f"RESULT-{i} " + "r" * 15000})
+        out = pack_refresh(msgs, model="m", tools=TOOLS, tool_choice=None)
+        self.assertEqual(len(out), 2)
+        joined = "\n".join(out)
+        self.assertIn("LOOP REQUEST", joined)
+        for i in range(6):
+            self.assertIn(f"RESULT-{i} ", joined)
+        positions = [joined.index(f"RESULT-{i} ") for i in range(6)]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn("USER REQUEST THIS TOOL LOOP IS SERVING", out[1])
+
+    def test_oversized_prefix_raises(self):
+        msgs = [{"role": "system", "content": "s" * 175_000}, {"role": "user", "content": "hi"}]
+        with self.assertRaises(StdinPayloadTooLarge):
+            pack_refresh(msgs, model="m", tools=None, tool_choice=None)
+
+    def test_active_loop_too_large_raises_instead_of_truncating(self):
+        msgs = [{"role": "user", "content": "go"}]
+        for i in range(15):
+            msgs.append({"role": "assistant", "content": "a" * 30000,
+                         "tool_calls": [_call(f"t{i}", "x", "{}")]})
+            msgs.append({"role": "tool", "tool_call_id": f"t{i}", "content": "z" * 1000})
+        with self.assertRaises(StdinPayloadTooLarge):
+            pack_refresh(msgs, model="m", tools=None, tool_choice=None)
+
+    def test_oneshot_pack_is_single_message_under_limit(self):
+        msgs = _big_history(400, 2000, "é") + [{"role": "user", "content": "LATEST ASK"}]
+        out = pack_oneshot(msgs, model="m", tools=TOOLS, tool_choice=None)
+        self.assertLess(utf8_len(out), MAX_STDIN_BYTES)
+        self.assertIn("LATEST ASK", out)
+        self.assertIn("earlier messages omitted]", out)
+
+
+class ByteGuardTests(unittest.TestCase):
+    def test_guard_rejects_at_limit_and_counts_bytes_not_chars(self):
+        check_stdin_bytes("a" * (MAX_STDIN_BYTES - 1))
+        with self.assertRaises(StdinPayloadTooLarge):
+            check_stdin_bytes("a" * MAX_STDIN_BYTES)
+        with self.assertRaises(StdinPayloadTooLarge):
+            check_stdin_bytes("日" * 60_000)  # 60k chars, 180k bytes
+
+    def test_small_delta_is_one_message(self):
+        out = split_delta([{"role": "user", "content": "hi"}])
+        self.assertEqual(len(out), 1)
+        self.assertIn("LATEST USER REQUEST", out[0])
+
+    def test_oversized_delta_splits_into_seeds_with_request_last(self):
+        delta = [{"role": "tool", "tool_call_id": f"t{i}", "content": f"OUT-{i} " + "日" * 6000}
+                 for i in range(40)]
+        out = split_delta(delta, pending_user_text="THE REQUEST")
+        self.assertGreater(len(out), 1)
+        for k, payload in enumerate(out[:-1], start=1):
+            self.assertLess(utf8_len(payload), MAX_STDIN_BYTES)
+            self.assertTrue(payload.startswith(f"[CONTEXT ONLY - PART {k} OF {len(out)}"))
+            self.assertNotIn("THE REQUEST", payload)
+        self.assertLess(utf8_len(out[-1]), MAX_STDIN_BYTES)
+        self.assertIn("THE REQUEST", out[-1])
+        joined = "\n".join(out)
+        positions = [joined.index(f"OUT-{i} ") for i in range(40)]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_single_huge_message_is_split_across_seeds(self):
+        delta = [{"role": "user", "content": "PASTE " + "q" * 400_000},
+                 {"role": "assistant", "content": "ok"}, {"role": "user", "content": "now answer"}]
+        out = split_delta(delta)
+        self.assertGreater(len(out), 2)
+        for payload in out:
+            self.assertLess(utf8_len(payload), MAX_STDIN_BYTES)
+        self.assertIn("now answer", out[-1])
+
+
+class StoreTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = PersistStore(Path(self.tmp.name))
+        self.store.records_dir.mkdir(parents=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_save_is_0600_and_round_trips(self):
+        record = _record(REPLY, scope_hash="abc")
+        self.store.save(record)
+        path = self.store.record_path("abc")
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        self.assertEqual(self.store.load("abc"), record)
+
+    def test_corrupt_record_reads_as_missing(self):
+        self.store.record_path("bad").write_text("{not json")
+        self.assertIsNone(self.store.load("bad"))
+
+    def test_mark_needs_refresh(self):
+        self.store.save(_record(REPLY, scope_hash="abc"))
+        self.store.mark_needs_refresh("abc")
+        self.assertTrue(self.store.load("abc")["needs_refresh"])
+
+    def test_gc_drops_old_records_and_their_conversation(self):
+        conv_dir = self.store.gemini_dir / "conversations"
+        conv_dir.mkdir(parents=True)
+        (conv_dir / "old-conv.db").write_text("x")
+        self.store.save(_record(REPLY, scope_hash="old", agy_conversation_id="old-conv"))
+        self.store.save(_record(REPLY, scope_hash="new"))
+        past = time.time() - persist.RECORD_MAX_AGE_SECONDS - 10
+        os.utime(self.store.record_path("old"), (past, past))
+        self.assertEqual(self.store.gc(), 1)
+        self.assertIsNone(self.store.load("old"))
+        self.assertIsNotNone(self.store.load("new"))
+        self.assertFalse((conv_dir / "old-conv.db").exists())
+
+    def test_kill_9_during_writes_never_leaves_a_corrupt_record(self):
+        script = textwrap.dedent(f"""
+            import sys
+            sys.path.insert(0, {str(REPO)!r})
+            from pathlib import Path
+            from persist import PersistStore
+            store = PersistStore(Path({self.tmp.name!r}))
+            i = 0
+            print("ready", flush=True)
+            while True:
+                i += 1
+                store.save({{"scope_hash": "k", "n": i, "pad": "p" * 400000}})
+        """)
+        for _ in range(3):
+            proc = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE, text=True)
+            self.assertEqual(proc.stdout.readline().strip(), "ready")
+            time.sleep(0.3)
+            os.kill(proc.pid, signal.SIGKILL)
+            proc.wait()
+            proc.stdout.close()
+            record = self.store.load("k")
+            self.assertIsNotNone(record)
+            self.assertEqual(len(record["pad"]), 400000)
+
+
+class LockTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "locks" / "k.lock"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _holder(self, hold_seconds, log=None):
+        script = textwrap.dedent(f"""
+            import sys, time
+            sys.path.insert(0, {str(REPO)!r})
+            from pathlib import Path
+            from persist import ConversationLock
+            lock = ConversationLock(Path({str(self.path)!r}))
+            assert lock.acquire(30)
+            log = {str(log) if log else ''!r}
+            if log:
+                open(log, "a").write("start\\n")
+            print("locked", flush=True)
+            time.sleep({hold_seconds})
+            if log:
+                open(log, "a").write("end\\n")
+            lock.release()
+        """)
+        return subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE, text=True)
+
+    def test_timeout_when_another_process_holds_it(self):
+        holder = self._holder(1.5)
+        self.assertEqual(holder.stdout.readline().strip(), "locked")
+        lock = ConversationLock(self.path)
+        self.assertFalse(lock.acquire(timeout=0.2))
+        self.assertTrue(lock.acquire(timeout=10))
+        lock.release()
+        holder.wait()
+        holder.stdout.close()
+
+    def test_two_processes_serialize(self):
+        log = Path(self.tmp.name) / "log"
+        a = self._holder(0.5, log)
+        b = self._holder(0.5, log)
+        for p in (a, b):
+            p.wait()
+            p.stdout.close()
+        self.assertEqual(log.read_text().split(), ["start", "end", "start", "end"])
+
+    def test_same_process_instances_exclude_each_other_and_release_is_idempotent(self):
+        first, second = ConversationLock(self.path), ConversationLock(self.path)
+        self.assertTrue(first.acquire(1))
+        self.assertFalse(second.acquire(0.1))
+        first.release()
+        first.release()
+        self.assertTrue(second.acquire(0.1))
+        second.release()
+
+
+if __name__ == "__main__":
+    unittest.main()
