@@ -72,6 +72,14 @@ try:
     from .delivery import DeliveryWatch
     from .stream import AntigravityStream, collect_stream_completion
     from .debug import dump_prompt_debug
+    from .persist import (
+        MAX_STDIN_BYTES,
+        check_stdin_bytes,
+        is_persistent_request,
+        pack_oneshot,
+        utf8_len,
+    )
+    from .session import run_persistent_turn
 except ImportError:
     from models import (
         _FALLBACK_MODELS,
@@ -115,6 +123,14 @@ except ImportError:
     from delivery import DeliveryWatch
     from stream import AntigravityStream, collect_stream_completion
     from debug import dump_prompt_debug
+    from persist import (
+        MAX_STDIN_BYTES,
+        check_stdin_bytes,
+        is_persistent_request,
+        pack_oneshot,
+        utf8_len,
+    )
+    from session import run_persistent_turn
 
 logger = logging.getLogger(__name__)
 
@@ -513,6 +529,9 @@ class AntigravityClient:
         # CPU seconds at the last sign of life: the discriminator between a
         # silent abandoned turn and a silent busy one.
         self._worker_cpu_at_activity: dict[subprocess.Popen, float] = {}
+        # In-flight persistent-conversation turns (session.PersistentTurn);
+        # cancel() and close() abort them. Their workers live in session.py.
+        self._persistent_turns: set[Any] = set()
 
     @staticmethod
     def _resolve_real_token_path() -> Path | None:
@@ -555,7 +574,13 @@ class AntigravityClient:
         if self._cancelled:
             raise RuntimeError("Antigravity request cancelled.")
 
+    def _abort_persistent_turns(self, reason: str) -> None:
+        for turn in tuple(getattr(self, "_persistent_turns", ())):
+            with contextlib.suppress(Exception):
+                turn.abort(reason)
+
     def _cancel_owned_requests(self) -> None:
+        self._abort_persistent_turns("cancelled")
         with self._lock:
             self._terminate_worker_locked()
             # Keep ownership and the lock until reaping finishes: owner close
@@ -592,6 +617,9 @@ class AntigravityClient:
         # conversations/*.db open, and taskkill /F /T is asynchronous, so
         # removing the workspace first would race the OS and fail with
         # WinError 32. Ordering is therefore load-bearing, not cosmetic.
+        # An in-flight persistent turn dies with its client; an idle persistent
+        # worker is left to its idle bound so the next client can reuse it.
+        self._abort_persistent_turns("client closed")
         with self._lock:
             self.is_closed = True
             self._terminate_worker_locked()
@@ -889,6 +917,41 @@ class AntigravityClient:
         finally:
             self._worker_lock.release()
 
+    def _start_persistent_turn(self, *, scope: str, model: str, effort: Any, messages: list,
+                               tools: Any, tool_choice: Any, timeout: float, media_paths: Any,
+                               auth_retry: bool = True) -> Any:
+        """run_persistent_turn with the per-client path's auth-contention retry.
+
+        A worker that dies during the handshake while its stderr shows OAuth
+        contention with another agy session is retried once (spawning re-syncs
+        the isolated token).
+        """
+        def attempt() -> Any:
+            return run_persistent_turn(
+                self,
+                scope=scope,
+                model=model,
+                effort=effort,
+                messages=messages,
+                tools=tools,
+                tool_choice=tool_choice,
+                timeout=timeout,
+                media_paths=media_paths,
+                idle_seconds=_worker_idle_seconds(),
+            )
+
+        try:
+            return attempt()
+        except Exception as exc:
+            proc = getattr(exc, "agy_proc", None)
+            if not auth_retry or proc is None or not _stderr_shows_auth_contention(proc):
+                raise
+            self._raise_if_cancelled()
+            logger.warning(
+                "Persistent agy worker failed amid token-source auth errors; retrying once."
+            )
+            return attempt()
+
     def _note_worker_activity(self, proc: subprocess.Popen) -> None:
         """Stamp a worker as alive; AntigravityStream calls this per stdout line.
 
@@ -1076,14 +1139,31 @@ class AntigravityClient:
         split into parts sent as consecutive turns of one agy conversation
         (see prompt._format_messages_as_segments).
         """
-        segments = _format_messages_as_segments(
-            messages,
-            model=model,
-            tools=tools,
-            tool_choice=tool_choice,
-            media_sink=self._materialized_media,
-            budget=full_send_segment_budget(model),
-        )
+        budget = full_send_segment_budget(model)
+        if budget is None:
+            # No split (Claude routes, or splitting disabled): one message,
+            # packed under agy's stdin byte limit (older history omitted).
+            segments = [
+                pack_oneshot(
+                    messages,
+                    model=model,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    media_sink=self._materialized_media,
+                )
+            ]
+        else:
+            segments = _format_messages_as_segments(
+                messages,
+                model=model,
+                tools=tools,
+                tool_choice=tool_choice,
+                media_sink=self._materialized_media,
+                budget=budget,
+            )
+        # A part over agy's stdin byte limit would be cut silently: refuse it.
+        for segment in segments:
+            check_stdin_bytes(segment)
         if len(segments) > 1:
             logger.info(
                 "Antigravity full send split into %d parts (%d chars) for %s",
@@ -1100,6 +1180,12 @@ class AntigravityClient:
             messages=messages,
         )
         return segments
+    def _cache_log_key(self) -> str:
+        """Groups this client's worker turns in the per-turn cache log."""
+        key = getattr(self, "_cache_log_key_value", None)
+        if key is None:
+            key = self._cache_log_key_value = f"worker:{os.urandom(6).hex()}"
+        return key
 
     def _run_oneshot_completion(
         self,
@@ -1180,6 +1266,7 @@ class AntigravityClient:
             delivery_watch=None,
             followup_segments=segments[1:],
             close_stdin_after_segments=True,
+            turn_kind="one-shot",
         )
         if stream:
             return stream_iter
@@ -1199,6 +1286,10 @@ class AntigravityClient:
         reasoning_effort: str | None = None,
         **extra_kwargs: Any,
     ) -> Any:
+        # Private routing hints from build_api_kwargs_extras; popped first so
+        # they reach no log or debug dump.
+        cache_scope = extra_kwargs.pop("_agy_cache_scope", None)
+        write_origin = extra_kwargs.pop("_agy_write_origin", None)
         self._raise_if_cancelled()
         if self.is_closed:
             raise RuntimeError("AntigravityClient is closed.")
@@ -1230,6 +1321,58 @@ class AntigravityClient:
             messages_list, self._materialized_media
         )
 
+        if is_persistent_request(cache_scope, write_origin, resolved_model):
+            persistent_stream = self._start_persistent_turn(
+                scope=cache_scope,
+                model=resolved_model,
+                effort=effort,
+                messages=messages_list,
+                tools=tools,
+                tool_choice=tool_choice,
+                timeout=effective_timeout,
+                media_paths=turn_media_paths,
+            )
+            if persistent_stream is not None:
+                if stream:
+                    return persistent_stream
+                completion = collect_stream_completion(persistent_stream)
+                self._raise_if_cancelled()
+                if _empty_no_result(completion) and _stderr_shows_auth_contention(
+                    persistent_stream.proc
+                ):
+                    # As on the per-client path: one retry on a fresh worker.
+                    # The aborted turn marked the record for refresh.
+                    logger.warning(
+                        "Persistent agy turn ended with no result amid token-source auth errors; "
+                        "retrying once."
+                    )
+                    retry_stream = self._start_persistent_turn(
+                        scope=cache_scope,
+                        model=resolved_model,
+                        effort=effort,
+                        messages=messages_list,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                        timeout=effective_timeout,
+                        media_paths=turn_media_paths,
+                        auth_retry=False,
+                    )
+                    if retry_stream is not None:
+                        completion = collect_stream_completion(retry_stream)
+                        self._raise_if_cancelled()
+                return completion
+            # Lock timeout: answer with a one-shot and leave the record alone.
+            self._ensure_worker_media_permissions(turn_media_paths, worker_turn=False)
+            return self._run_oneshot_completion(
+                model=resolved_model,
+                effort=effort,
+                messages=messages_list,
+                timeout=effective_timeout,
+                tools=tools,
+                tool_choice=tool_choice,
+                stream=stream,
+            )
+
         worker_acquired = self._worker_lock.acquire(blocking=False)
         if worker_acquired:
             try:
@@ -1249,21 +1392,26 @@ class AntigravityClient:
                     is_continuation = _messages_match_prefix(ref_history, messages_list)
                     conv_id_to_resume = self._worker_conversation_id if is_continuation else None
 
-                comparable_full_send = not is_continuation
-                followup_segments: list[str] = []
                 if is_continuation:
-                    proc = self._get_or_spawn_worker(
-                        resolved_model, effort, conversation_id=conv_id_to_resume
-                    )
-                    delta_msgs = messages_list[len(ref_history):]
                     prompt_payload = _format_delta_prompt(
-                        delta_msgs,
+                        messages_list[len(ref_history):],
                         pending_user_text=_latest_user_text(messages_list),
                         media_sink=self._materialized_media,
                     )
                     holder = [prompt_payload]
                     self._apply_native_block_note(holder, messages_list)
                     prompt_payload = holder[0]
+                    # A delta agy would truncate restarts from a full send.
+                    if utf8_len(prompt_payload) >= MAX_STDIN_BYTES:
+                        is_continuation = False
+
+                comparable_full_send = not is_continuation
+                followup_segments: list[str] = []
+                turn_kind = "worker-delta" if is_continuation else "worker-full"
+                if is_continuation:
+                    proc = self._get_or_spawn_worker(
+                        resolved_model, effort, conversation_id=conv_id_to_resume
+                    )
                     dump_prompt_debug(
                         prompt=prompt_payload,
                         branch="delta",
@@ -1286,6 +1434,7 @@ class AntigravityClient:
                     self._apply_native_block_note(segments, messages_list)
                     prompt_payload, followup_segments = segments[0], segments[1:]
 
+                check_stdin_bytes(prompt_payload)
                 event_msg = {"event": "user", "message": {"content": prompt_payload}}
                 try:
                     self._raise_if_cancelled()
@@ -1294,6 +1443,7 @@ class AntigravityClient:
                 except (BrokenPipeError, OSError):
                     self._raise_if_cancelled()
                     comparable_full_send = True
+                    turn_kind = "worker-full"
                     with self._lock:
                         self._terminate_worker_locked(keep_conversation=False)
                         self._purge_isolated_conversations()
@@ -1329,6 +1479,8 @@ class AntigravityClient:
                     delivery_watch=self._delivery_watch if comparable_full_send else None,
                     delivery_sample_key=f"{resolved_model}:{effort}",
                     followup_segments=followup_segments,
+                    turn_kind=turn_kind,
+                    conversation_key=self._cache_log_key(),
                 )
                 if stream:
                     return stream_iter
@@ -1388,6 +1540,8 @@ class AntigravityClient:
                         delivery_watch=self._delivery_watch if comparable_full_send else None,
                         delivery_sample_key=f"{resolved_model}:{effort}",
                         followup_segments=followup_segments,
+                        turn_kind=turn_kind,
+                        conversation_key=self._cache_log_key(),
                     )
                 try:
                     self._raise_if_cancelled()

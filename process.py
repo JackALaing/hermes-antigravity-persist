@@ -12,6 +12,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 from collections import deque
 from pathlib import Path
@@ -86,6 +87,32 @@ def write_media_read_permissions(
     full media-rule set now present in the file.
     """
     settings_path = Path(isolated_gemini_dir) / "settings.json"
+    # Persistent conversations share one isolated home, so concurrent turns
+    # can update this file at once: serialize the read-modify-write (or one
+    # turn's rules are lost) and give every writer its own temp file.
+    with _settings_lock(settings_path):
+        return _merge_media_rules(settings_path, paths, isolated_gemini_dir)
+
+
+@contextlib.contextmanager
+def _settings_lock(settings_path: Path):
+    fd = None
+    try:
+        fd = os.open(str(settings_path) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except (OSError, ImportError):  # no flock (Windows): best effort, as before
+        pass
+    try:
+        yield
+    finally:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
+def _merge_media_rules(settings_path: Path, paths: Any, isolated_gemini_dir: Any) -> frozenset[str]:
     try:
         settings = _json.loads(settings_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -107,9 +134,15 @@ def write_media_read_permissions(
                 existing.add(rule)
     permissions["allow"] = allow
     settings["permissions"] = permissions
-    tmp_path = settings_path.with_suffix(".json.tmp")
-    tmp_path.write_text(_json.dumps(settings, indent=1), encoding="utf-8")
-    os.replace(tmp_path, settings_path)
+    fd, tmp_name = tempfile.mkstemp(prefix="settings.", suffix=".json.tmp", dir=str(settings_path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(_json.dumps(settings, indent=1))
+        os.replace(tmp_name, settings_path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
     return read_media_rules(isolated_gemini_dir)
 
 
@@ -1056,9 +1089,58 @@ def build_child_env(isolated_home: Path | str) -> dict[str, str]:
     return env
 
 
+_LOG_PID_RE = re.compile(r"Starting language server process with pid (\d+)")
+_LOG_PID_CACHE: dict[str, int | None] = {}
+
+
+def _log_pid(path: Path) -> int | None:
+    """The agy process a cli log belongs to (agy names its pid near the top)."""
+    key = str(path)
+    if key in _LOG_PID_CACHE:
+        return _LOG_PID_CACHE[key]
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+            head = handle.read(8192)
+    except OSError:
+        return None
+    match = _LOG_PID_RE.search(head)
+    pid = int(match.group(1)) if match else None
+    if pid is not None or len(head) >= 8192:
+        if len(_LOG_PID_CACHE) > 512:
+            _LOG_PID_CACHE.clear()
+        _LOG_PID_CACHE[key] = pid
+    return pid
+
+
+_QUOTA_LOG_SCAN_LIMIT = 400
+
+
+def _select_quota_log(log_files: list[Path], pid: int | None) -> Path | None:
+    """The newest log, or with ``pid`` the log of that process.
+
+    Persistent conversations share one agy home, so the newest log may belong
+    to another conversation's process. When no log names any pid (an older or
+    newer agy log format), fall back to the newest log as before.
+    """
+    if pid is None:
+        return log_files[0]
+    named = False
+    # Every recent log, not just the newest few: a long-lived worker's log
+    # falls behind those of busier conversations in the shared home. Log
+    # pids are cached and logs over three days old are collected, so this
+    # stays cheap.
+    for path in log_files[:_QUOTA_LOG_SCAN_LIMIT]:
+        owner = _log_pid(path)
+        if owner == pid:
+            return path
+        named = named or owner is not None
+    return None if named else log_files[0]
+
+
 def _check_early_quota_error(
     gemini_dir: Path | str | None,
     min_mtime: float | None = None,
+    pid: int | None = None,
 ) -> str | None:
     """Check isolated agy logs for early RESOURCE_EXHAUSTED / 429 quota exhaustion.
 
@@ -1084,7 +1166,9 @@ def _check_early_quota_error(
         if not log_files:
             return None
 
-        latest_log = log_files[0]
+        latest_log = _select_quota_log(log_files, pid)
+        if latest_log is None:
+            return None
         if min_mtime is not None:
             # Allow 2.0s margin for filesystem timestamp resolution
             if latest_log.stat().st_mtime < (min_mtime - 2.0):

@@ -125,6 +125,14 @@ def _full_send_splitting_enabled(model: str) -> bool:
         except ImportError:
             return False
     return full_send_segment_budget(model) is not None
+def _current_write_origin() -> str:
+    """Hermes' write origin for the running turn ('' when unavailable)."""
+    try:
+        from tools.skill_provenance import get_current_write_origin
+
+        return str(get_current_write_origin() or "")
+    except Exception:
+        return ""
 
 
 class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
@@ -163,7 +171,14 @@ class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
         model: str | None = None,
         **context: Any,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Extract reasoning effort and forward as top-level api_kwargs to AntigravityClient."""
+        """Forward reasoning effort and the conversation routing hints.
+
+        ``cache_scope_id`` (the rotation-stable conversation scope) and the
+        current write origin decide whether the client keeps a persistent agy
+        conversation for this request: only main-agent turns
+        (``assistant_tool``) with a scope do. The client pops both private
+        keys before anything is logged.
+        """
         effort = None
         if isinstance(reasoning_config, dict):
             if reasoning_config.get("enabled") is False:
@@ -173,6 +188,10 @@ class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
         top_level: dict[str, Any] = {}
         if effort:
             top_level["reasoning_effort"] = str(effort).strip().lower()
+        scope = context.get("cache_scope_id")
+        if isinstance(scope, str) and scope.strip():
+            top_level["_agy_cache_scope"] = scope
+            top_level["_agy_write_origin"] = _current_write_origin()
         return {}, top_level
 
     def fetch_models(
@@ -287,6 +306,9 @@ def _classify_antigravity_error(
             "empty result (status=\"success\")",
             "max_trajectory_tokens",
             "max trajectory tokens",
+            # persist.StdinPayloadTooLarge: compaction shrinks the request.
+            "exceeds agy's stdin limit",
+            "exceed agy's stdin limit",
         )
     ):
         return {
