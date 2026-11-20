@@ -72,6 +72,7 @@ class FakeAgy:
         self.stdout = _Stdout()
         self.stderr = None
         self.received = []
+        self.cumulative = {}
         self.first = True
         resume = cmd[cmd.index("--conversation") + 1] if "--conversation" in cmd else None
         if resume is not None and resume in world.conversations and not world.lose_conversations:
@@ -111,12 +112,17 @@ class FakeAgy:
             reply = self.world.next_reply()
         n = len(self.world.conversations[self.conversation])
         usage = {"input_tokens": 100 * n, "output_tokens": 7, "cache_read_tokens": 1000 * n}
-        self._emit({"event": "step_update", "step_update": {
-            "conversation_id": self.conversation, "step_type": "agent_response",
-            "text_delta": reply, "usage": usage}})
+        step = {"conversation_id": self.conversation, "step_type": "agent_response",
+                "text_delta": reply}
+        if not self.world.no_step_usage:
+            step["usage"] = usage
+        self._emit({"event": "step_update", "step_update": step})
+        # result.usage accumulates over the process lifetime, as agy's does.
+        for field, value in usage.items():
+            self.cumulative[field] = self.cumulative.get(field, 0) + value
         self._emit({"event": "result", "result": {
             "conversation_id": self.conversation, "status": "SUCCESS", "response": reply,
-            "usage": {"input_tokens": 999999, "output_tokens": 99999, "cache_read_tokens": 9999999}}})
+            "usage": dict(self.cumulative)}})
 
 
 class World:
@@ -127,6 +133,7 @@ class World:
         self.replies = []
         self.seed_reply = "ACK"
         self.lose_conversations = False
+        self.no_step_usage = False
 
     def next_reply(self):
         return self.replies.pop(0) if self.replies else f"reply {len(self.procs)}"
@@ -231,13 +238,17 @@ class PersistentSessionTests(unittest.TestCase):
         self.world.procs[0].kill()  # process gone (idle reap, crash, restart)
         session._REGISTRY.clear()
         m2 = m1 + [self._reply(c1), {"role": "user", "content": "recall it"}]
-        self._create(self._client(), m2)
+        c2 = self._create(self._client(), m2)
         self.assertEqual(len(self.world.procs), 2)
         second = self.world.procs[1]
         self.assertIn("--conversation", second.cmd)
         self.assertEqual(second.conversation, self.world.procs[0].conversation)
         self.assertEqual(len(second.received), 1)
         self.assertIn("recall it", second.received[0])
+        usage = c2.usage
+        # Second message on the resumed conversation: this step's context
+        # (which includes the planted turn), not a per-process counter.
+        self.assertEqual((usage.prompt_tokens, usage.completion_tokens), (200 + 2000, 7))
 
     def test_resume_rejected_when_conversation_not_found_refreshes(self):
         client = self._client()
@@ -343,6 +354,21 @@ class PersistentSessionTests(unittest.TestCase):
         usage = [c for c in chunks if getattr(c, "usage", None)][-1].usage
         self.assertEqual(usage.prompt_tokens, 200 + 2000)
         self.assertEqual(usage.completion_tokens, 7)
+
+    def test_seed_advances_usage_baseline_for_result_usage_fallback(self):
+        client = self._client()
+        self.world.no_step_usage = True
+        history = []
+        for i in range(120):
+            history += [{"role": "user", "content": f"u{i} " + "x" * 3000},
+                        {"role": "assistant", "content": f"a{i} " + "x" * 3000}]
+        history.append({"role": "user", "content": "FINAL"})
+        completion = self._create(client, history)
+        self.assertEqual(len(self.world.procs[0].received), 2)
+        # result.usage after the turn is cumulative (seed 100 + turn 200);
+        # only the real turn's increment is reported.
+        self.assertEqual(completion.usage.prompt_tokens, 200 + 2000)
+        self.assertEqual(completion.usage.completion_tokens, 7)
 
     def test_non_ack_seed_aborts_discards_conversation_and_raises(self):
         client = self._client()
