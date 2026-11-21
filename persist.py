@@ -542,24 +542,77 @@ def _canonical_arguments(arguments: Any) -> str:
     return json.dumps(arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def _hermes_dedupe_key(name: str, arguments: Any) -> tuple[str, str]:
+    """The key Hermes drops repeated calls by (``AIAgent._deduplicate_tool_calls``).
+
+    Valid JSON arguments are canonicalised; anything else is compared as is.
+    """
+    try:
+        arguments = json.dumps(json.loads(arguments), separators=(",", ":"), sort_keys=True)
+    except (TypeError, ValueError):
+        pass
+    return name, arguments if isinstance(arguments, str) else repr(arguments)
+
+
 def reply_fingerprint(message: dict[str, Any]) -> str:
     """sha256 of the visible text plus ordered (name, canonical args) calls.
 
     Tool-call ids are excluded on purpose: Hermes renames reused ids
-    (``<id>_d<n>``) and the model's own ids are arbitrary.
+    (``<id>_d<n>``) and the model's own ids are arbitrary. Repeated calls
+    (same name and arguments) count once, first one kept: Hermes drops them
+    before it stores the reply, and agy repeats a call when a turn runs a
+    second model step.
     """
     calls = []
+    seen: set[tuple[str, str]] = set()
     for call in message.get("tool_calls") or []:
         if not isinstance(call, dict):
             continue
         function = call.get("function") or {}
-        calls.append([str(function.get("name") or ""), _canonical_arguments(function.get("arguments", {}))])
+        name = str(function.get("name") or "")
+        arguments = function.get("arguments", {})
+        key = _hermes_dedupe_key(name, arguments)
+        if key in seen:
+            continue
+        seen.add(key)
+        calls.append([name, _canonical_arguments(arguments)])
     payload = json.dumps(
         {"text": visible_text(message.get("content")), "calls": calls},
         sort_keys=True,
         ensure_ascii=False,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def hermes_stored_content(content: Any) -> str:
+    """Reply text as Hermes stores it, using Hermes' own helpers.
+
+    Hermes strips reasoning blocks and redacts credentials before the reply
+    enters its history (``_assistant_content_for_storage``), so the next
+    request can carry, say, ``ROMA_API_KEY=***`` where agy wrote
+    ``ROMA_API_KEY=...``. Runs in Hermes' process with its redaction policy;
+    a helper that is missing or fails leaves the text as it is.
+    """
+    text = _flatten_content(content)
+    try:
+        from agent.agent_runtime_helpers import strip_think_blocks
+
+        text = strip_think_blocks(None, text).strip()
+    except Exception:
+        pass
+    if text:
+        try:
+            from agent.redact import redact_sensitive_text
+
+            text = redact_sensitive_text(text)
+        except Exception:
+            pass
+    return text
+
+
+def stored_reply_fingerprint(message: dict[str, Any]) -> str:
+    """Fingerprint of ``message`` after Hermes' storage rewrite (hermes_stored_content)."""
+    return reply_fingerprint(dict(message, content=hermes_stored_content(message.get("content"))))
 
 
 def tools_hash(tools: Sequence[Any] | None) -> str:
@@ -660,7 +713,9 @@ def decide(
     if int(record.get("agy_size_tokens") or 0) > refresh_size_tokens():
         return Decision(False, "conversation size")
     index = last_assistant_index(messages)
-    if index is None or reply_fingerprint(messages[index]) != record.get("last_reply_fp"):
+    # The reply as agy streamed it, or as Hermes stored it (see hermes_stored_content).
+    expected = {fp for fp in (record.get("last_reply_fp"), record.get("last_reply_stored_fp")) if fp}
+    if index is None or reply_fingerprint(messages[index]) not in expected:
         return Decision(False, "fingerprint mismatch")
     if user_fingerprint(messages, index) != record.get("last_user_fp"):
         return Decision(False, "earlier request changed")

@@ -121,11 +121,15 @@ class FakeAgy:
         usage = {"input_tokens": 100 * n, "output_tokens": 7, "cache_read_tokens": 1000 * n}
         if self.world.real_usage and not seed:
             usage = dict(self.world.real_usage)
-        step = {"conversation_id": self.conversation, "step_type": "agent_response",
-                "text_delta": reply}
-        if not self.world.no_step_usage:
-            step["usage"] = usage
-        self._emit({"event": "step_update", "step_update": step})
+        # A list is one turn that runs several model steps, one text each.
+        steps = reply if isinstance(reply, list) else [reply]
+        reply = "".join(steps)
+        for text in steps:
+            step = {"conversation_id": self.conversation, "step_type": "agent_response",
+                    "text_delta": text}
+            if not self.world.no_step_usage:
+                step["usage"] = usage
+            self._emit({"event": "step_update", "step_update": step})
         # result.usage accumulates over the process lifetime, as agy's does.
         for field, value in usage.items():
             self.cumulative[field] = self.cumulative.get(field, 0) + value
@@ -160,6 +164,14 @@ class World:
 
     def popen(self, cmd, **kwargs):
         return FakeAgy(self, cmd)
+
+
+def _hermes_redacts():
+    try:
+        from agent.redact import redact_sensitive_text
+    except Exception:
+        return False
+    return redact_sensitive_text("`ROMA_API_KEY=...` x") == "`ROMA_API_KEY=*** x"
 
 
 def _fake_setup_home(cwd):
@@ -338,7 +350,7 @@ class PersistentSessionTests(unittest.TestCase):
             "tools changed": lambda r: r.update(tools_hash="x"),
             "size": lambda r: r.update(agy_size_tokens=persist.REFRESH_SIZE_TOKENS + 1),
             "needs refresh": lambda r: r.update(needs_refresh=True),
-            "fingerprint": lambda r: r.update(last_reply_fp="0" * 64),
+            "fingerprint": lambda r: r.update(last_reply_fp="0" * 64, last_reply_stored_fp="0" * 64),
         }
         for name, mutate in triggers.items():
             with self.subTest(name):
@@ -355,6 +367,60 @@ class PersistentSessionTests(unittest.TestCase):
                 self.assertEqual(len(self.world.procs), 2)
                 self.assertNotIn("--conversation", self.world.procs[1].cmd)
                 self.assertIn(f"q-{name}", self.world.procs[1].received[0])
+
+    # -- the reply as Hermes stores it -------------------------------------
+    # Hermes rewrites a reply before it enters its history; the next request
+    # carries that version. Observed live (Chief, 2026-11-21): each of these
+    # refreshed a healthy conversation with "fingerprint mismatch".
+
+    def _resume_after(self, reply_steps, stored_from_reply):
+        client = self._client()
+        self.world.replies = [reply_steps]
+        m1 = [{"role": "system", "content": "sys"}, {"role": "user", "content": "first question"}]
+        c1 = self._create(client, m1)
+        stored = stored_from_reply(self._reply(c1))
+        m2 = m1 + [stored, {"role": "tool", "tool_call_id": "call_2", "content": "tool output"}
+                   if stored.get("tool_calls") else {"role": "user", "content": "second question"}]
+        with self.assertLogs(level="INFO") as logs:
+            self._create(client, m2)
+        return c1, logs.output
+
+    def _assert_resumed(self, logs):
+        self.assertEqual([line for line in logs if "Refreshing persistent agy" in line], [])
+        self.assertTrue([line for line in logs if "Antigravity turn cache: kind=resume" in line], logs)
+        self.assertEqual(len(self.world.workers), 1, "the live worker is reused")
+        self.assertEqual(len(self.world.workers[0].received), 2, "only the new messages are sent")
+
+    def test_resume_after_two_step_turn_whose_repeated_call_hermes_dropped(self):
+        # agy's second model step re-emits the first step's call (same id);
+        # Hermes keeps one ("Removed duplicate tool call: web_extract").
+        frame = ('<tool_call>{"id": "call_2", "type": "function", "function": {"name": "terminal",'
+                 ' "arguments": "{\\"command\\": \\"ls\\"}"}}</tool_call>')
+
+        def hermes_dedupe(reply):
+            return dict(reply, tool_calls=reply["tool_calls"][:1])
+
+        c1, logs = self._resume_after([frame, frame], hermes_dedupe)
+        self.assertEqual(len(c1.choices[0].message.tool_calls), 2, "the fork streams both calls")
+        self._assert_resumed(logs)
+
+    @unittest.skipUnless(_hermes_redacts(), "Hermes' redaction is not importable")
+    def test_resume_after_reply_hermes_redacted(self):
+        # Delivered as 1,047 characters, stored as 1,046: Hermes masked the
+        # placeholder value and the closing backtick.
+        text = "Put `ROMA_API_KEY=...` in the profile's `.env`."
+
+        def hermes_redact(reply):
+            return dict(reply, content="Put `ROMA_API_KEY=*** in the profile's `.env`.")
+
+        _c1, logs = self._resume_after(text, hermes_redact)
+        self._assert_resumed(logs)
+
+    def test_edited_reply_still_refreshes(self):
+        _c1, logs = self._resume_after("The answer is 42.",
+                                       lambda reply: dict(reply, content="The answer is 41."))
+        self.assertTrue([line for line in logs if "fingerprint mismatch" in line], logs)
+        self.assertEqual(len(self.world.workers), 2)
 
     def test_effort_change_respawns_with_conversation_not_refresh(self):
         client = self._client()

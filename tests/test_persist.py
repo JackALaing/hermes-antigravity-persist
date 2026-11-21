@@ -142,6 +142,109 @@ class DecideTests(unittest.TestCase):
         self.assertEqual(self._decide(_record(REPLY), HISTORY).reason, "empty delta")
 
 
+def _hermes_redacts():
+    try:
+        from agent.redact import redact_sensitive_text
+    except Exception:
+        return False
+    return redact_sensitive_text("`ROMA_API_KEY=...` x") == "`ROMA_API_KEY=*** x"
+
+
+def _committed(streamed, user="fix it"):
+    """The record session.commit writes for a streamed reply."""
+    return _record(streamed, last_reply_stored_fp=persist.stored_reply_fingerprint(streamed),
+                   last_user_fp=persist.user_fingerprint([{"role": "user", "content": user}], 1))
+
+
+class HermesStoredReplyTests(unittest.TestCase):
+    """The next request carries the reply as Hermes stored it, not as agy streamed it.
+
+    Cases observed on Chief (2026-11-21), each refreshed with "fingerprint mismatch".
+    """
+
+    def setUp(self):
+        self.th = tools_hash(TOOLS)
+
+    def _decide(self, record, stored, user="fix it", tail=None):
+        messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": user}, stored,
+                    *(tail or [{"role": "tool", "tool_call_id": "call_2", "content": "ok"}])]
+        return decide(record, messages, model="m", tools_hash=self.th)
+
+    def test_repeated_call_from_a_second_model_step_matches_hermes_dedupe(self):
+        # 01:30 and 02:32: agy re-emitted call_2; Hermes renamed it call_2_d2,
+        # then dropped it as a duplicate and stored a single call.
+        streamed = {"role": "assistant", "content": "", "tool_calls": [
+            _call("call_2", "web_extract", '{"urls": ["https://roma.app/learn/properties"]}'),
+            _call("call_2_d2", "web_extract", '{"urls":["https://roma.app/learn/properties"]}')]}
+        stored = dict(streamed, tool_calls=streamed["tool_calls"][:1])
+        self.assertEqual(reply_fingerprint(stored), reply_fingerprint(streamed))
+        self.assertTrue(self._decide(_committed(streamed), stored).resume)
+
+    def test_one_repeat_among_several_calls(self):
+        # 00:45: six calls streamed, five stored (one web_extract repeated).
+        calls = [_call("c1", "web_search", '{"query": "a"}'), _call("c2", "web_search", '{"query": "b"}'),
+                 _call("c3", "web_extract", '{"urls": ["u"]}'), _call("c4", "web_search", '{"query": "c"}'),
+                 _call("c5", "web_extract", '{ "urls" : ["u"] }'), _call("c6", "web_search", '{"query": "d"}')]
+        streamed = {"role": "assistant", "content": "", "tool_calls": calls}
+        stored = dict(streamed, tool_calls=[c for c in calls if c["id"] != "c5"])
+        self.assertTrue(self._decide(_committed(streamed), stored).resume)
+
+    @unittest.skipUnless(_hermes_redacts(), "Hermes' redaction is not importable")
+    def test_redacted_reply_matches(self):
+        # 02:22: 1,047 characters delivered, 1,046 stored.
+        streamed = {"role": "assistant", "content": "Put `ROMA_API_KEY=...` in the profile's `.env`."}
+        stored = dict(streamed, content="Put `ROMA_API_KEY=*** in the profile's `.env`.")
+        self.assertNotEqual(reply_fingerprint(stored), reply_fingerprint(streamed))
+        d = self._decide(_committed(streamed), stored, tail=[{"role": "user", "content": "next"}])
+        self.assertTrue(d.resume, d.reason)
+
+    def test_unredacted_reply_still_matches(self):
+        streamed = {"role": "assistant", "content": "Put `ROMA_API_KEY=...` in `.env`."}
+        d = self._decide(_committed(streamed), streamed, tail=[{"role": "user", "content": "next"}])
+        self.assertTrue(d.resume, d.reason)
+
+    def test_record_without_stored_fingerprint_still_resumes(self):
+        # Records written before the stored fingerprint existed.
+        self.assertTrue(self._decide(_record(REPLY), REPLY, tail=[{"role": "tool", "content": "ok"}]).resume)
+
+    # -- the safety property ------------------------------------------------
+    def test_distinct_calls_are_not_merged(self):
+        one = {"role": "assistant", "content": "", "tool_calls": [_call("a", "terminal", '{"command": "ls"}')]}
+        two = dict(one, tool_calls=[*one["tool_calls"], _call("b", "terminal", '{"command": "pwd"}')])
+        self.assertNotEqual(reply_fingerprint(one), reply_fingerprint(two))
+        self.assertFalse(self._decide(_committed(two), one).resume)
+
+    def test_edited_reply_refreshes(self):
+        streamed = {"role": "assistant", "content": "Put `ROMA_API_KEY=...` in `.env`."}
+        for edited in ("Put `ROMA_API_KEY=...` in `.env` now.", "Put `OTHER_KEY=*** in `.env`."):
+            with self.subTest(edited):
+                d = self._decide(_committed(streamed), dict(streamed, content=edited),
+                                 tail=[{"role": "user", "content": "next"}])
+                self.assertEqual((d.resume, d.reason), (False, "fingerprint mismatch"))
+
+    def test_rewound_history_refreshes(self):
+        earlier = {"role": "assistant", "content": "First answer."}
+        latest = {"role": "assistant", "content": "", "tool_calls": [
+            _call("call_2", "terminal", '{"command": "ls"}'), _call("call_2", "terminal", '{"command": "ls"}')]}
+        messages = [{"role": "user", "content": "q1"}, earlier, {"role": "user", "content": "q2 again"}]
+        d = decide(_committed(latest, user="q2"), messages, model="m", tools_hash=self.th)
+        self.assertEqual((d.resume, d.reason), (False, "fingerprint mismatch"))
+
+    def test_identical_earlier_reply_does_not_stand_in_for_the_last(self):
+        streamed = {"role": "assistant", "content": "Put `ROMA_API_KEY=...` in `.env`."}
+        stored = dict(streamed, content="Put `ROMA_API_KEY=*** in `.env`.")
+        record = _committed(streamed, user="second")
+        # The same reply to an earlier request, history undone to just after it.
+        d = decide(record, [{"role": "user", "content": "first"}, stored, {"role": "user", "content": "x"}],
+                   model="m", tools_hash=self.th)
+        self.assertEqual((d.resume, d.reason), (False, "earlier request changed"))
+        # The same reply earlier on, a different reply last.
+        d = decide(record, [{"role": "user", "content": "second"}, stored,
+                            {"role": "user", "content": "more"}, {"role": "assistant", "content": "other"},
+                            {"role": "user", "content": "go"}], model="m", tools_hash=self.th)
+        self.assertEqual((d.resume, d.reason), (False, "fingerprint mismatch"))
+
+
 def _big_history(n, size, char="x"):
     msgs = [{"role": "system", "content": "You are Hermes."}]
     for i in range(n):
