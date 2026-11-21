@@ -174,6 +174,15 @@ def _hermes_redacts():
     return redact_sensitive_text("`ROMA_API_KEY=...` x") == "`ROMA_API_KEY=*** x"
 
 
+def _hermes_splits_batches():
+    try:
+        from agent.tool_call_batches import expand_local_tool_batches  # noqa: F401
+        from agent.transports.types import ToolCall  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
 def _fake_setup_home(cwd):
     home = Path(cwd) / "home"
     gemini = home / ".gemini" / "antigravity-cli"
@@ -415,6 +424,33 @@ class PersistentSessionTests(unittest.TestCase):
 
         _c1, logs = self._resume_after(text, hermes_redact)
         self._assert_resumed(logs)
+
+    def _resume_after_split_batch(self, first, second):
+        # agy streams one tool_call batch; Hermes stores one call per entry, the
+        # second under a child id it derives (Chief's state.db rows 33059, 33114).
+        entries = [{"name": "mcp__roma__list_agents", "arguments": {}},
+                   {"name": "mcp__roma__manage_triggers", "arguments": {"action": "list"}}]
+        arguments = json.dumps(json.dumps({"calls": entries}))
+        frame = (f'<tool_call>{{"id": "{first}", "type": "function", "function": '
+                 f'{{"name": "tool_call", "arguments": {arguments}}}}}</tool_call>')
+
+        def hermes_split(reply):
+            return dict(reply, tool_calls=[
+                {"id": cid, "call_id": cid, "type": "function",
+                 "function": {"name": "tool_call", "arguments": json.dumps({"calls": [entry]})}}
+                for cid, entry in zip((first, second), entries)])
+
+        c1, logs = self._resume_after(frame, hermes_split)
+        self.assertEqual(len(c1.choices[0].message.tool_calls), 1, "the fork streams one batch")
+        self._assert_resumed(logs)
+
+    @unittest.skipUnless(_hermes_splits_batches(), "Hermes' batch splitting is not importable")
+    def test_resume_after_tool_call_batch_hermes_split_0245(self):
+        self._resume_after_split_batch("call_51", "call_ea496249b67e")
+
+    @unittest.skipUnless(_hermes_splits_batches(), "Hermes' batch splitting is not importable")
+    def test_resume_after_tool_call_batch_hermes_split_0249(self):
+        self._resume_after_split_batch("call_56", "call_28504e7be997")
 
     def test_edited_reply_still_refreshes(self):
         _c1, logs = self._resume_after("The answer is 42.",

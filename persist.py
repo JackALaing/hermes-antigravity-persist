@@ -28,12 +28,14 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import hashlib
+import importlib
 import json
 import logging
 import os
 import re
 import shutil
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -584,6 +586,62 @@ def reply_fingerprint(message: dict[str, Any]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+# Hermes' own helpers for the reply as it stores it, imported on first use.
+# The plugin runs inside Hermes, so these are the running Hermes' functions.
+_HERMES_HELPER_SOURCES = (
+    ("strip_think_blocks", "agent.agent_runtime_helpers", "strip_think_blocks"),
+    ("redact", "agent.redact", "redact_sensitive_text"),
+    ("expand_batches", "agent.tool_call_batches", "expand_local_tool_batches"),
+    ("ToolCall", "agent.transports.types", "ToolCall"),
+    ("max_children", "tools.delegate_tool", "_get_max_concurrent_children"),
+)
+_hermes_helpers_cache: Optional[dict[str, Any]] = None
+_hermes_helpers_lock = threading.Lock()
+_hermes_call_failures: set[str] = set()
+
+
+def _hermes_helpers() -> dict[str, Any]:
+    """Hermes' storage helpers that import, by key; one WARNING lists any that do not.
+
+    A missing helper's step is skipped, so the stored fingerprint stays nearer
+    the streamed reply: a turn Hermes rewrote that way refreshes, never resumes
+    wrongly.
+    """
+    global _hermes_helpers_cache
+    with _hermes_helpers_lock:
+        if _hermes_helpers_cache is None:
+            helpers, missing = {}, []
+            for key, module, name in _HERMES_HELPER_SOURCES:
+                try:
+                    helpers[key] = getattr(importlib.import_module(module), name)
+                except Exception as exc:
+                    missing.append(f"{module}.{name} ({type(exc).__name__}: {exc})")
+            if missing:
+                logger.warning(
+                    "Hermes helpers unavailable, so replies Hermes rewrites that way will refresh "
+                    "the persistent agy conversation: %s", "; ".join(missing))
+            _hermes_helpers_cache = helpers
+        return _hermes_helpers_cache
+
+
+def _hermes_call(key: str, *args: Any, **kwargs: Any) -> Any:
+    """Call Hermes helper ``key``; raise LookupError when it is missing or fails.
+
+    A failure (Hermes changed the helper) logs one WARNING per helper.
+    """
+    helper = _hermes_helpers().get(key)
+    if helper is None:
+        raise LookupError(key)
+    try:
+        return helper(*args, **kwargs)
+    except Exception as exc:
+        if key not in _hermes_call_failures:
+            _hermes_call_failures.add(key)
+            logger.warning("Hermes helper %s failed (%s: %s); skipping that step of the stored-reply "
+                           "fingerprint", key, type(exc).__name__, exc)
+        raise LookupError(key) from exc
+
+
 def hermes_stored_content(content: Any) -> str:
     """Reply text as Hermes stores it, using Hermes' own helpers.
 
@@ -594,25 +652,97 @@ def hermes_stored_content(content: Any) -> str:
     a helper that is missing or fails leaves the text as it is.
     """
     text = _flatten_content(content)
-    try:
-        from agent.agent_runtime_helpers import strip_think_blocks
-
-        text = strip_think_blocks(None, text).strip()
-    except Exception:
-        pass
+    with contextlib.suppress(LookupError):
+        text = _hermes_call("strip_think_blocks", None, text).strip()
     if text:
-        try:
-            from agent.redact import redact_sensitive_text
-
-            text = redact_sensitive_text(text)
-        except Exception:
-            pass
+        with contextlib.suppress(LookupError):
+            text = _hermes_call("redact", text)
     return text
 
 
+def _validated_arguments(arguments: Any) -> str:
+    """Arguments after Hermes' tool-call validation (``validate_tool_calls``).
+
+    Objects become JSON, other non-strings ``str()``, and an empty or blank
+    string (or none) ``"{}"``. Repeated here: Hermes does this inside
+    ``validate_tool_calls``, which needs a live agent.
+    """
+    if isinstance(arguments, (dict, list)):
+        return json.dumps(arguments)
+    if arguments is not None and not isinstance(arguments, str):
+        arguments = str(arguments)
+    if not arguments or not arguments.strip():
+        return "{}"
+    return arguments
+
+
+def _expanded_batches(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Hermes' ``expand_local_tool_batches``: one ``tool_call`` batch of local
+    tools becomes one call per entry."""
+    tool_call = _hermes_helpers().get("ToolCall")
+    if tool_call is None:
+        return calls
+    try:
+        objects = [tool_call(id=call.get("id"), name=call["function"]["name"],
+                             arguments=call["function"]["arguments"]) for call in calls]
+        expanded = _hermes_call("expand_batches", objects, provider_data=None)
+        return [{"id": c.id, "type": "function",
+                 "function": {"name": c.function.name, "arguments": c.function.arguments}}
+                for c in expanded]
+    except (LookupError, TypeError, AttributeError):
+        return calls
+
+
+def _capped_delegate_calls(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Hermes' ``AIAgent._cap_delegate_task_calls``: delegate_task calls past
+    ``max_concurrent_children`` are dropped, others kept.
+
+    Its limit is Hermes' own (``_get_max_concurrent_children``); the trimming is
+    repeated here because Hermes' method logs a warning each time it trims.
+    """
+    count = sum(1 for call in calls if call["function"]["name"] == "delegate_task")
+    if not count:
+        return calls
+    try:
+        limit = int(_hermes_call("max_children"))
+    except (LookupError, TypeError, ValueError):
+        return calls
+    if count <= limit:
+        return calls
+    kept, capped = 0, []
+    for call in calls:
+        if call["function"]["name"] == "delegate_task":
+            if kept >= limit:
+                continue
+            kept += 1
+        capped.append(call)
+    return capped
+
+
+def hermes_stored_tool_calls(tool_calls: Sequence[Any] | None) -> list[dict[str, Any]]:
+    """Tool calls as Hermes stores them, in the order its turn applies each step
+    (``agent/turn_tool_round.py``): validation's argument normalisation, then
+    batch splitting, then the delegate_task cap. Its last step, dropping
+    repeated calls, is reply_fingerprint's own.
+    """
+    calls = []
+    for call in tool_calls or []:
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function") or {}
+        calls.append({"id": call.get("id"), "type": "function",
+                      "function": {"name": str(function.get("name") or ""),
+                                   "arguments": _validated_arguments(function.get("arguments"))}})
+    return _capped_delegate_calls(_expanded_batches(calls))
+
+
 def stored_reply_fingerprint(message: dict[str, Any]) -> str:
-    """Fingerprint of ``message`` after Hermes' storage rewrite (hermes_stored_content)."""
-    return reply_fingerprint(dict(message, content=hermes_stored_content(message.get("content"))))
+    """Fingerprint of ``message`` as Hermes stores it (hermes_stored_content,
+    hermes_stored_tool_calls)."""
+    stored = dict(message, content=hermes_stored_content(message.get("content")))
+    if message.get("tool_calls"):
+        stored["tool_calls"] = hermes_stored_tool_calls(message["tool_calls"])
+    return reply_fingerprint(stored)
 
 
 def tools_hash(tools: Sequence[Any] | None) -> str:

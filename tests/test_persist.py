@@ -245,6 +245,145 @@ class HermesStoredReplyTests(unittest.TestCase):
         self.assertEqual((d.resume, d.reason), (False, "fingerprint mismatch"))
 
 
+def _hermes_splits_batches():
+    try:
+        from agent.tool_call_batches import expand_local_tool_batches  # noqa: F401
+        from agent.transports.types import ToolCall  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def _stored_row(first_id, second_id):
+    """Tool calls of Chief's state.db rows 33059 (02:45) and 33114 (02:49), as stored."""
+    def call(cid, entry):
+        return {"id": cid, "call_id": cid, "response_item_id": "fc_" + cid.removeprefix("call_"),
+                "type": "function", "function": {"name": "tool_call",
+                                                 "arguments": json.dumps({"calls": [entry]})}}
+    return {"role": "assistant", "content": "", "tool_calls": [
+        call(first_id, {"name": "mcp__roma__list_agents", "arguments": {}}),
+        call(second_id, {"name": "mcp__roma__manage_triggers", "arguments": {"action": "list"}})]}
+
+
+# (time, stored row): the second id is the child id Hermes derived from the first.
+BATCH_SPLIT_ROWS = (("02:45", _stored_row("call_51", "call_ea496249b67e")),
+                    ("02:49", _stored_row("call_56", "call_28504e7be997")))
+# Spellings agy may stream for the same two-entry batch; Hermes normalises each.
+BATCH_SPELLINGS = (
+    [{"name": "mcp__roma__list_agents", "arguments": {}},
+     {"name": "mcp__roma__manage_triggers", "arguments": {"action": "list"}}],
+    [{"name": "mcp__roma__list_agents"},
+     {"name": "mcp__roma__manage_triggers", "arguments": '{"action": "list"}'}],
+    [{"name": "mcp__roma__list_agents", "arguments": ""},
+     {"name": "mcp__roma__manage_triggers", "arguments": {"action": "list"}}],
+)
+
+
+def _batch(cid, entries):
+    return {"role": "assistant", "content": "", "tool_calls": [
+        _call(cid, "tool_call", json.dumps({"calls": entries}))]}
+
+
+class HermesToolPipelineTests(unittest.TestCase):
+    """Hermes reshapes a reply's tool calls before storing it (agent/turn_tool_round.py):
+    validation turns blank arguments into "{}", a tool_call batch of local tools is
+    split into one call per entry, delegate_task calls past the limit are dropped,
+    then repeated calls are. The record must match the result."""
+
+    def setUp(self):
+        self.th = tools_hash(TOOLS)
+
+    def _decide(self, record, stored):
+        messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "fix it"}, stored,
+                    {"role": "tool", "tool_call_id": "x", "content": "ok"}]
+        return decide(record, messages, model="m", tools_hash=self.th)
+
+    @unittest.skipUnless(_hermes_splits_batches(), "Hermes' batch splitting is not importable")
+    def test_split_tool_call_batch_resumes(self):
+        # 02:45:42 and 02:49:19 on Chief: agy streamed one tool_call carrying
+        # list_agents and manage_triggers; Hermes stored two calls.
+        from agent.message_sanitization import deterministic_call_id
+
+        for time_, stored in BATCH_SPLIT_ROWS:
+            first, second = stored["tool_calls"]
+            self.assertEqual(second["id"], deterministic_call_id(
+                "tool_call", first["id"] + second["function"]["arguments"], 1), "split by Hermes")
+            for spelling in BATCH_SPELLINGS:
+                with self.subTest(time_, spelling=spelling):
+                    streamed = _batch(first["id"], spelling)
+                    self.assertNotEqual(reply_fingerprint(streamed), reply_fingerprint(stored))
+                    d = self._decide(_committed(streamed), stored)
+                    self.assertTrue(d.resume, d.reason)
+
+    @unittest.skipUnless(_hermes_splits_batches(), "Hermes' batch splitting is not importable")
+    def test_split_batch_with_a_different_entry_refreshes(self):
+        _time, stored = BATCH_SPLIT_ROWS[0]
+        for entries in (
+            [{"name": "mcp__roma__list_agents", "arguments": {}},
+             {"name": "mcp__roma__manage_triggers", "arguments": {"action": "create"}}],
+            [{"name": "mcp__roma__manage_triggers", "arguments": {"action": "list"}},
+             {"name": "mcp__roma__list_agents", "arguments": {}}],
+            [{"name": "mcp__roma__list_agents", "arguments": {}}],
+        ):
+            with self.subTest(entries=entries):
+                d = self._decide(_committed(_batch("call_51", entries)), stored)
+                self.assertEqual((d.resume, d.reason), (False, "fingerprint mismatch"))
+
+    @unittest.skipUnless(_hermes_splits_batches(), "Hermes' batch splitting is not importable")
+    def test_split_batch_and_a_repeated_entry_drops_the_repeat(self):
+        # Splitting comes before dropping repeats: the batch's own copy of an
+        # entry that also arrived on its own is dropped.
+        lone = _call("c1", "tool_call", json.dumps({"calls": [{"name": "mcp__roma__list_agents", "arguments": {}}]}))
+        streamed = {"role": "assistant", "content": "", "tool_calls": [
+            lone, *_batch("c2", BATCH_SPELLINGS[0])["tool_calls"]]}
+        stored = dict(streamed, tool_calls=[lone, _stored_row("c2", "c3")["tool_calls"][1]])
+        self.assertTrue(self._decide(_committed(streamed), stored).resume)
+
+    def test_blank_arguments_stored_as_empty_object(self):
+        streamed = {"role": "assistant", "content": "", "tool_calls": [_call("a", "todo", "")]}
+        stored = dict(streamed, tool_calls=[_call("a", "todo", "{}")])
+        self.assertTrue(self._decide(_committed(streamed), stored).resume)
+        # Normalised first, so "" and "{}" are one call repeated.
+        streamed = dict(streamed, tool_calls=[_call("a", "todo", " "), _call("b", "todo", "{}")])
+        self.assertTrue(self._decide(_committed(streamed), stored).resume)
+
+    def test_delegate_calls_past_hermes_limit_are_dropped(self):
+        calls = [_call(f"d{i}", "delegate_task", json.dumps({"goal": f"g{i}"})) for i in range(3)]
+        streamed = {"role": "assistant", "content": "", "tool_calls": [calls[0], _call("t", "terminal", "{}"),
+                                                                       *calls[1:]]}
+        stored = dict(streamed, tool_calls=streamed["tool_calls"][:3])
+        helpers = dict(persist._hermes_helpers(), max_children=lambda: 2)
+        with patch.object(persist, "_hermes_helpers_cache", helpers):
+            self.assertTrue(self._decide(_committed(streamed), stored).resume)
+        # Within the limit nothing is dropped, so the shorter history is a different reply.
+        helpers["max_children"] = lambda: 3
+        with patch.object(persist, "_hermes_helpers_cache", helpers):
+            d = self._decide(_committed(streamed), stored)
+        self.assertEqual((d.resume, d.reason), (False, "fingerprint mismatch"))
+
+    def test_missing_hermes_helpers_warn_once_and_refresh_split_batches(self):
+        _time, stored = BATCH_SPLIT_ROWS[0]
+        streamed = _batch("call_51", BATCH_SPELLINGS[0])
+        real_import = persist.importlib.import_module
+
+        def no_agent(name, *args, **kwargs):
+            if name.startswith(("agent.", "tools.")):
+                raise ImportError(f"no module named {name!r}")
+            return real_import(name, *args, **kwargs)
+
+        with patch.object(persist, "_hermes_helpers_cache", None), \
+                patch.object(persist.importlib, "import_module", no_agent), \
+                self.assertLogs(persist.logger, level="WARNING") as logs:
+            first = self._decide(_committed(streamed), stored)
+            again = self._decide(_committed(streamed), stored)
+            # Text and other calls are still fingerprinted, unchanged.
+            self.assertTrue(self._decide(_committed(REPLY), REPLY).resume)
+        self.assertEqual(len(logs.output), 1, logs.output)
+        self.assertIn("agent.tool_call_batches.expand_local_tool_batches", logs.output[0])
+        self.assertEqual((first.resume, first.reason), (False, "fingerprint mismatch"))
+        self.assertFalse(again.resume)
+
+
 def _big_history(n, size, char="x"):
     msgs = [{"role": "system", "content": "You are Hermes."}]
     for i in range(n):
