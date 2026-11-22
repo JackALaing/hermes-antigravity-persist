@@ -784,6 +784,28 @@ def user_fingerprint(messages: Sequence[Any], before: int) -> str:
     return ""
 
 
+def request_fingerprint(messages: Sequence[Any]) -> str:
+    """sha256 of a request after its system prompt: how many messages it holds,
+    its last assistant reply (reply_fingerprint) and every message after that
+    reply, by role, call id and text.
+
+    Recorded with each turn. Hermes sends the same request again when it does
+    not keep agy's reply: it retries a tool call whose arguments it cannot
+    parse or repair without storing the reply (``agent/turn_truncation.py``).
+    agy's conversation then holds a reply Hermes never kept, so that request
+    must refresh. A next request that kept the reply holds more messages
+    (that reply and what follows it), so it never fingerprints the same.
+    """
+    index = last_assistant_index(messages)
+    anchor = reply_fingerprint(messages[index]) if index is not None else ""
+    start = index + 1 if index is not None else 0
+    tail = [[_role(m), str(m.get("tool_call_id") or ""), visible_text(m.get("content"))]
+            for m in messages[start:] if isinstance(m, dict) and _role(m) != "system"]
+    count = sum(1 for m in messages if isinstance(m, dict) and _role(m) != "system")
+    payload = json.dumps({"count": count, "anchor": anchor, "tail": tail}, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _role(message: Any) -> str:
     return str(message.get("role") or "").strip().lower() if isinstance(message, dict) else ""
 
@@ -825,6 +847,8 @@ def decide(
     that reply answered must match too (an undo back to an identical earlier
     reply), and so must the system prompt (instructions deployed while the
     conversation lives) unless ``ANTIGRAVITY_REFRESH_ON_SYSTEM_CHANGE=0``.
+    The very request agy last answered, sent again, refreshes: Hermes did not
+    keep that reply (see request_fingerprint).
     """
     if record is None:
         return Decision(False, "no record")
@@ -842,6 +866,9 @@ def decide(
         return Decision(False, "system prompt changed")
     if int(record.get("agy_size_tokens") or 0) > refresh_size_tokens():
         return Decision(False, "conversation size")
+    if record.get("last_request_fp") == request_fingerprint(messages):
+        # agy already answered this exact request; Hermes did not keep that reply.
+        return Decision(False, "last reply not kept (same request re-sent)")
     index = last_assistant_index(messages)
     # The reply as agy streamed it, or as Hermes stored it (see hermes_stored_content).
     expected = {fp for fp in (record.get("last_reply_fp"), record.get("last_reply_stored_fp")) if fp}

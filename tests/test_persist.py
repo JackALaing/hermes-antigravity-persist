@@ -384,6 +384,123 @@ class HermesToolPipelineTests(unittest.TestCase):
         self.assertFalse(again.resume)
 
 
+def _hermes_repair():
+    try:
+        from agent.message_sanitization import _repair_tool_call_arguments
+    except Exception:
+        return None
+    return _repair_tool_call_arguments
+
+
+# Replies Hermes did not keep (2026-11-21): the model wrote tool arguments that
+# are not JSON, Hermes' repair gave up ("Unrepairable tool_call arguments ...
+# replaced with empty object") and Hermes re-sent the same request without
+# storing the reply. Arguments trimmed from the logged ones; each keeps its flaw.
+NEWS_HISTORY = [  # News state.db rows 5179-5183, trimmed
+    {"role": "system", "content": "sys"},
+    {"role": "user", "content": '[IMPORTANT: The user has invoked the "x-twitter" skill] X morning read'},
+    {"role": "assistant", "content": "", "tool_calls": [
+        _call("call_recover_text", "terminal", '{"command": "python3 x-ranked-feed-curator.py recover-text"}')]},
+    {"role": "tool", "tool_call_id": "call_recover_text", "content": '{"output": "{\\"halted\\": null}"}'},
+]
+CHIEF_HISTORY = [  # Chief state.db rows 34287 and 34296, trimmed
+    {"role": "system", "content": "sys"},
+    {"role": "user", "content": "[Jack Laing] Pause the Roma bridge."},
+    {"role": "assistant", "content": "The Roma bridge is paused and disabled."},
+    {"role": "user", "content": "[Jack Laing] [ASYNC DELEGATION BATCH COMPLETE — deleg_cffed125] ..."},
+]
+DROPPED_REPLIES = (
+    # 08:17, 08:18, 08:20 and 08:21 on News: a shell '\'' inside a JSON string.
+    ("news 08:17", NEWS_HISTORY, "terminal",
+     r"""{"command": "python3 x-ranked-feed-curator.py render-native --input-json"""
+     r""" '{\"why\":\"Based on the author'\''s report.\"}'"}"""),
+    # 08:19 on News: a shell '"'"' ends the JSON string early.
+    ("news 08:19", NEWS_HISTORY, "terminal",
+     r"""{"command":"python3 x-ranked-feed-curator.py render-native --input-json"""
+     r""" '{\"why\":\"verify OpenRouter'"'"'s notice.\"}'"}"""),
+    # 18:17 on Chief: a Python \' inside a JSON string.
+    ("chief 18:17", CHIEF_HISTORY, "execute_code",
+     r"""{"code":"print('plans for Jack\'s approval')\n"}"""),
+)
+
+
+def _turn_record(messages, reply):
+    """The record session.commit writes after agy answers ``messages`` with ``reply``."""
+    return _record(reply, last_reply_stored_fp=persist.stored_reply_fingerprint(reply),
+                   last_user_fp=persist.user_fingerprint(messages, len(messages)),
+                   last_request_fp=persist.request_fingerprint(messages))
+
+
+class DroppedReplyTests(unittest.TestCase):
+    """Hermes sends the request agy just answered again when it does not keep the
+    reply. That must refresh (agy's conversation holds the discarded reply), and
+    the log must say so rather than report a fingerprint mismatch."""
+
+    def setUp(self):
+        self.th = tools_hash(TOOLS)
+
+    def _decide(self, record, messages):
+        return decide(record, messages, model="m", tools_hash=self.th)
+
+    def test_hermes_discards_these_replies(self):
+        repair = _hermes_repair()
+        if repair is None:
+            self.skipTest("Hermes' argument repair is not importable")
+        for label, _history, name, args in DROPPED_REPLIES:
+            with self.subTest(label):
+                with self.assertLogs("agent.message_sanitization", level="WARNING") as logs:
+                    self.assertEqual(repair(args, name), "{}")
+                self.assertIn("Unrepairable tool_call arguments", logs.output[0])
+
+    def test_resent_request_refreshes_as_reply_not_kept(self):
+        for label, history, name, args in DROPPED_REPLIES:
+            with self.subTest(label):
+                dropped = {"role": "assistant", "content": "", "tool_calls": [_call("call_9", name, args)]}
+                d = self._decide(_turn_record(history, dropped), list(history))
+                self.assertEqual((d.resume, d.reason), (False, "last reply not kept (same request re-sent)"))
+
+    def test_dropped_reply_identical_to_the_previous_one_does_not_resume(self):
+        # Hermes discards "Done." and sends the request again, which also ends
+        # with "Done.": the reply fingerprint matches, but agy holds the extra reply.
+        history = [{"role": "user", "content": "go"}, {"role": "assistant", "content": "Done."},
+                   {"role": "user", "content": "again"}]
+        reply = {"role": "assistant", "content": "Done."}
+        d = self._decide(_turn_record(history, reply), list(history))
+        self.assertEqual((d.resume, d.reason), (False, "last reply not kept (same request re-sent)"))
+        # Kept and followed by the same words, it resumes: the request grew.
+        follow = [*history, reply, {"role": "user", "content": "again"}]
+        d = self._decide(_turn_record(history, reply), follow)
+        self.assertTrue(d.resume, d.reason)
+        self.assertEqual(d.delta, [{"role": "user", "content": "again"}])
+
+    def test_kept_reply_still_resumes(self):
+        for label, history, _name, _args in DROPPED_REPLIES:
+            with self.subTest(label):
+                reply = {"role": "assistant", "content": "", "tool_calls": [
+                    _call("call_9", "terminal", '{"command": "ls"}')]}
+                follow = [*history, reply, {"role": "tool", "tool_call_id": "call_9", "content": "ok"}]
+                d = self._decide(_turn_record(history, reply), follow)
+                self.assertTrue(d.resume, d.reason)
+
+    def test_other_requests_after_a_dropped_reply_still_report_a_mismatch(self):
+        _label, history, name, args = DROPPED_REPLIES[0]
+        dropped = {"role": "assistant", "content": "", "tool_calls": [_call("call_9", name, args)]}
+        record = _turn_record(history, dropped)
+        changed = (
+            [*history[:-1], dict(history[-1], content="different output")],  # tool output differs
+            [*history, {"role": "user", "content": "stop"}],  # a message added
+            history[:-1],  # a message removed
+        )
+        for messages in changed:
+            with self.subTest(messages=messages[-1]):
+                d = self._decide(record, messages)
+                self.assertEqual((d.resume, d.reason), (False, "fingerprint mismatch"))
+        # Records written before the request fingerprint existed.
+        record.pop("last_request_fp")
+        d = self._decide(record, list(history))
+        self.assertEqual((d.resume, d.reason), (False, "fingerprint mismatch"))
+
+
 def _big_history(n, size, char="x"):
     msgs = [{"role": "system", "content": "You are Hermes."}]
     for i in range(n):

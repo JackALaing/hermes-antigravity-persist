@@ -458,6 +458,28 @@ class PersistentSessionTests(unittest.TestCase):
         self.assertTrue([line for line in logs if "fingerprint mismatch" in line], logs)
         self.assertEqual(len(self.world.workers), 2)
 
+    def test_request_sent_again_after_hermes_dropped_the_reply_refreshes(self):
+        # Chief 18:17 and News 08:17-08:20 (2026-11-21): the model wrote tool
+        # arguments Hermes could not repair, so Hermes discarded the reply and
+        # sent the same request again. agy's conversation holds that reply.
+        bad = r"""{"code":"print('plans for Jack\'s approval')\n"}"""
+        frame = "<tool_call>" + json.dumps({"id": "call_9", "type": "function", "function": {
+            "name": "execute_code", "arguments": bad}}) + "</tool_call>"
+        client = self._client()
+        self.world.replies = [frame]
+        m1 = [{"role": "system", "content": "sys"}, {"role": "user", "content": "first question"},
+              {"role": "assistant", "content": "First answer."}, {"role": "user", "content": "go on"}]
+        c1 = self._create(client, m1)
+        self.assertEqual(c1.choices[0].message.tool_calls[0].function.arguments, bad)
+        with self.assertLogs(level="INFO") as logs:
+            self._create(client, [dict(m) for m in m1])
+        refreshes = [line for line in logs.output if "Refreshing persistent agy" in line]
+        self.assertEqual(len(refreshes), 1, logs.output)
+        self.assertTrue(refreshes[0].endswith("last reply not kept (same request re-sent)"), refreshes)
+        self.assertEqual(len(self.world.workers), 2)
+        self.assertNotIn("--conversation", self.world.workers[1].cmd)
+        self.assertIn("first question", self.world.workers[1].received[0], "the rebuild re-sends the history")
+
     def test_effort_change_respawns_with_conversation_not_refresh(self):
         client = self._client()
         m1 = [{"role": "user", "content": "q"}]
