@@ -1336,7 +1336,7 @@ def _has_unparseable_tool_call_frame(
     protocol frame with no call. Unclosed frames are
     :func:`_has_unfinished_tool_call_frame`'s concern.
     """
-    _calls, cleaned = _parse_tool_block(text, state=state)
+    _calls, cleaned = _parse_tool_block(text, state=state, repair=False)
     return _has_closed_tool_call_frame(cleaned, state=state)
 
 
@@ -1394,10 +1394,93 @@ def _extract_tagged_tool_calls(
     return calls, "\n".join(part.strip() for part in text_parts if part and part.strip()).strip()
 
 
+_JSON_ESCAPES = frozenset('"\\/bfnrtu')
+_SHELL_DQ_QUOTE = "'\"'\"'"  # the shell idiom for ' inside single quotes: '"'"'
+
+
+def _repair_quote_escapes(arguments: str) -> str | None:
+    """Repair shell or Python quote escapes the model wrote unescaped in JSON.
+
+    The model sometimes writes a terminal command or Python source into a
+    JSON string without escaping it for JSON: the shell idioms ``'\\''`` and
+    ``'"'"'`` or Python's ``\\'``. ``\\'`` is not a JSON escape and a bare
+    ``"`` ends the string, so the arguments do not parse and Hermes replaces
+    them with ``{}``. Inside JSON strings only, an invalid ``\\'`` becomes an
+    escaped backslash followed by ``'`` and ``'"'"'`` gets its two quotes
+    escaped, so the decoded value is exactly the text the model wrote (the
+    shell or Python still reads it as an apostrophe). Valid escapes such as
+    ``\\\\'`` are copied as they are.
+
+    Returns the repaired arguments when they parse as JSON, else None.
+    Callers try this only after ``json.loads`` of the original has failed.
+    """
+    out: list[str] = []
+    in_string = False
+    changed = 0
+    index, size = 0, len(arguments)
+    while index < size:
+        char = arguments[index]
+        if not in_string:
+            in_string = char == '"'
+            out.append(char)
+            index += 1
+        elif char == "\\":
+            follower = arguments[index + 1 : index + 2]
+            if follower == "'":
+                out.append("\\\\'")
+                changed += 1
+            elif follower and follower in _JSON_ESCAPES:
+                out.append(char + follower)
+            else:
+                return None
+            index += 2
+        elif arguments.startswith(_SHELL_DQ_QUOTE, index):
+            # A '"' followed by ' cannot close a JSON string, so this only
+            # matches where the original is already invalid.
+            out.append("'\\\"'\\\"'")
+            changed += 1
+            index += len(_SHELL_DQ_QUOTE)
+        else:
+            in_string = char != '"'
+            out.append(char)
+            index += 1
+    if not changed:
+        return None
+    repaired = "".join(out)
+    try:
+        json.loads(repaired)
+    except ValueError:
+        return None
+    return repaired
+
+
+def _repaired_arguments(name: str, arguments: str) -> str:
+    """``arguments`` unchanged when they parse, else a narrow quote-escape repair.
+
+    Anything the repair cannot turn into valid JSON passes through untouched,
+    so Hermes' own argument handling still applies to it.
+    """
+    try:
+        json.loads(arguments)
+        return arguments
+    except ValueError:
+        pass
+    repaired = _repair_quote_escapes(arguments)
+    if repaired is None:
+        return arguments
+    logger.info("Repaired shell/Python quote escapes in %s tool-call arguments (%d chars)",
+                name, len(arguments))
+    return repaired
+
+
 def _parse_tool_block(
-    block: str, state: _MarkdownCodeState | None = None
+    block: str, state: _MarkdownCodeState | None = None, *, repair: bool = True
 ) -> tuple[list[Any], str]:
-    """Parse tool call blocks, returning (tool_call_deltas, cleaned_text)."""
+    """Parse tool call blocks, returning (tool_call_deltas, cleaned_text).
+
+    ``repair`` applies :func:`_repaired_arguments` to string arguments; callers
+    that only read ``cleaned_text`` turn it off so a repair is logged once.
+    """
     calls: list[Any] = []
     cleaned_text = ""
     if _TOOL_CALL_OPEN in block:
@@ -1416,6 +1499,8 @@ def _parse_tool_block(
         args = getattr(fn, "arguments", "{}") if fn else "{}"
         if not isinstance(args, str):
             args = json.dumps(args, ensure_ascii=False)
+        elif repair:
+            args = _repaired_arguments(name, args)
         deltas.append(
             SimpleNamespace(
                 index=i,

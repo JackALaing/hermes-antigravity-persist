@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import os
+import shlex
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -670,3 +672,127 @@ def test_prose_ending_with_lone_angle_bracket_after_a_complete_call_succeeds():
 
     assert [call.id for call in calls] == ["same"]
     assert finishes == ["tool_calls"]
+
+
+# -- quote-escape repair of tool-call arguments ---------------------------------
+# Shell and Python quote escapes the model wrote into JSON strings without
+# escaping them for JSON (News 08:17-08:20 and Chief 18:17, 2026-11-21). Each
+# excerpt keeps the real call's shape; Hermes replaced the originals with {}.
+
+def _args_after_parse(arguments: str, name: str = "terminal") -> str:
+    obj = {"id": "call_1", "type": "function", "function": {"name": name, "arguments": arguments}}
+    calls, _text = _parse_tool_block(f"<tool_call>{json.dumps(obj)}</tool_call>")
+    assert len(calls) == 1
+    return calls[0].function.arguments
+
+
+def _curator_payload(command: str) -> dict:
+    argv = shlex.split(command)
+    assert argv[:4] == ["python3", "/tmp/curator.py", "render-native", "--input-json"]
+    assert len(argv) == 5, argv
+    return json.loads(argv[4])
+
+
+_NEWS_CASES = [
+    pytest.param(  # 08:17 '\''
+        r"""{"command": "python3 /tmp/curator.py render-native --input-json '{\"what\":\"Caveat: this is Berkopec'\''s report of an OpenRouter email.\",\"why\":\"Charlie O'\''Neill shares a lesson; the authors'\'' own claims.\"}'"}""",
+        r"""python3 /tmp/curator.py render-native --input-json '{"what":"Caveat: this is Berkopec'\''s report of an OpenRouter email.","why":"Charlie O'\''Neill shares a lesson; the authors'\'' own claims."}'""",
+        {"what": "Caveat: this is Berkopec's report of an OpenRouter email.",
+         "why": "Charlie O'Neill shares a lesson; the authors' own claims."},
+        id="news-0817",
+    ),
+    pytest.param(  # 08:18 '\''
+        r"""{"command":"python3 /tmp/curator.py render-native --input-json '{\"what\":\"Developer leoshen0 reports that Antigravity'\''s built-in prompt drives heavy upfront reads.\",\"why\":\"Based on the author'\''s report of an OpenRouter email.\"}'"}""",
+        r"""python3 /tmp/curator.py render-native --input-json '{"what":"Developer leoshen0 reports that Antigravity'\''s built-in prompt drives heavy upfront reads.","why":"Based on the author'\''s report of an OpenRouter email."}'""",
+        {"what": "Developer leoshen0 reports that Antigravity's built-in prompt drives heavy upfront reads.",
+         "why": "Based on the author's report of an OpenRouter email."},
+        id="news-0818",
+    ),
+    pytest.param(  # 08:19 '"'"', next to escaped quotes
+        r"""{"command":"python3 /tmp/curator.py render-native --input-json '{\"what\":\"Decentralized Economy argues that Pearl'"'"'s \\\"useful work\\\" mining model is broken.\",\"why\":\"Verify OpenRouter'"'"'s official notice; the authors'"'"' own framing.\"}'"}""",
+        r"""python3 /tmp/curator.py render-native --input-json '{"what":"Decentralized Economy argues that Pearl'"'"'s \"useful work\" mining model is broken.","why":"Verify OpenRouter'"'"'s official notice; the authors'"'"' own framing."}'""",
+        {"what": 'Decentralized Economy argues that Pearl\'s "useful work" mining model is broken.',
+         "why": "Verify OpenRouter's official notice; the authors' own framing."},
+        id="news-0819",
+    ),
+    pytest.param(  # 08:20 '\''
+        r"""{"command": "python3 /tmp/curator.py render-native --input-json '{\"what\":\"Hermes Release Watch highlights Nous Research'\''s official Advanced Delegation plugin.\",\"why\":\"Caveat: this is Berkopec'\''s report.\"}'"}""",
+        r"""python3 /tmp/curator.py render-native --input-json '{"what":"Hermes Release Watch highlights Nous Research'\''s official Advanced Delegation plugin.","why":"Caveat: this is Berkopec'\''s report."}'""",
+        {"what": "Hermes Release Watch highlights Nous Research's official Advanced Delegation plugin.",
+         "why": "Caveat: this is Berkopec's report."},
+        id="news-0820",
+    ),
+]
+
+
+@pytest.mark.parametrize("arguments, command, payload", _NEWS_CASES)
+def test_shell_quote_idioms_in_terminal_arguments_are_repaired(arguments, command, payload, caplog):
+    with pytest.raises(ValueError):
+        json.loads(arguments)
+
+    with caplog.at_level(logging.INFO, logger="prompt"):
+        repaired = _args_after_parse(arguments)
+
+    # The decoded command is exactly the one the model wrote, and the shell
+    # reads each idiom as an apostrophe inside the single-quoted payload.
+    assert json.loads(repaired) == {"command": command}
+    assert _curator_payload(command) == payload
+    assert [r.getMessage() for r in caplog.records] == [
+        f"Repaired shell/Python quote escapes in terminal tool-call arguments ({len(arguments)} chars)"]
+
+
+def test_python_quote_escape_in_execute_code_arguments_is_repaired():
+    # Chief 18:17: \' inside a single-quoted Python string, where a bare '
+    # would end the string. The decoded source keeps \' and Python reads '.
+    arguments = (r"""{"code":"line = ('\\t- Draft for Jack\'s approval. Awaiting Jack\'s approval on Dispatch.'"""
+                 r""" + ' (Workhorse research)')\nprint(line)\n"}""")
+    with pytest.raises(ValueError):
+        json.loads(arguments)
+
+    code = json.loads(_args_after_parse(arguments, "execute_code"))["code"]
+
+    assert code == ("line = ('\\t- Draft for Jack\\'s approval. Awaiting Jack\\'s approval on Dispatch.'"
+                    " + ' (Workhorse research)')\nprint(line)\n")
+    scope: dict = {}
+    exec(compile(code.replace("print(line)", ""), "<case>", "exec"), scope)
+    assert scope["line"] == "\t- Draft for Jack's approval. Awaiting Jack's approval on Dispatch. (Workhorse research)"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "echo 'it'\\''s'",          # '\\'' : an escaped backslash, then a quote
+        "echo 'it'\"'\"'s'",        # '\"'\"' : already escaped
+        "print('Jack\\'s')",        # \\' : an escaped backslash
+        "C:\\\\path\\\\'x'",
+        "plain text with ' and \" and \\",
+        "",
+    ],
+)
+def test_valid_arguments_are_never_changed(value, caplog):
+    for arguments in (json.dumps({"command": value}), json.dumps({"command": value}, ensure_ascii=False, indent=2),
+                      json.dumps([value, {"k": value}]), '{"command":' + json.dumps(value) + "}"):
+        with caplog.at_level(logging.INFO, logger="prompt"):
+            assert _args_after_parse(arguments) == arguments
+    assert caplog.records == []
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        r"""{\'command\': \'ls\'}""",                           # \' outside any string
+        r"""{'command': 'ls'}""",                               # Python dict syntax
+        r"""{"command":"echo it\'s""",                          # truncated
+        r"""{"command":"echo it\'s \q"}""",                     # another invalid escape
+        r"""{"command":"echo it\'s",}x""",                      # still invalid after the repair
+        r"""{"command":"echo 'it'"'"s'"}""",                    # '"'" without the closing quote
+        r"""{"a": 1, '"'"' : 2}""",                              # the idiom outside a string
+        "{\"code\":\"x = 'Jack\\'s'\n\"}",                       # \' plus a raw newline
+        "not json at all",
+        "",
+    ],
+)
+def test_unrepairable_arguments_pass_through_untouched(arguments, caplog):
+    with caplog.at_level(logging.INFO, logger="prompt"):
+        assert _args_after_parse(arguments) == arguments
+    assert caplog.records == []

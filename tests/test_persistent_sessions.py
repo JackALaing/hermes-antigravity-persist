@@ -462,7 +462,8 @@ class PersistentSessionTests(unittest.TestCase):
         # Chief 18:17 and News 08:17-08:20 (2026-11-21): the model wrote tool
         # arguments Hermes could not repair, so Hermes discarded the reply and
         # sent the same request again. agy's conversation holds that reply.
-        bad = r"""{"code":"print('plans for Jack\'s approval')\n"}"""
+        # (The fork now repairs those quote escapes; \q is not one of them.)
+        bad = r"""{"code":"print('C:\qdir')\n"}"""
         frame = "<tool_call>" + json.dumps({"id": "call_9", "type": "function", "function": {
             "name": "execute_code", "arguments": bad}}) + "</tool_call>"
         client = self._client()
@@ -479,6 +480,44 @@ class PersistentSessionTests(unittest.TestCase):
         self.assertEqual(len(self.world.workers), 2)
         self.assertNotIn("--conversation", self.world.workers[1].cmd)
         self.assertIn("first question", self.world.workers[1].received[0], "the rebuild re-sends the history")
+
+    def test_resume_after_reply_whose_quote_escapes_the_fork_repaired(self):
+        # News 08:17 (2026-11-21): a shell '\'' idiom unescaped in the JSON
+        # arguments. The fork delivers repaired arguments, Hermes stores them
+        # as delivered (they parse), and the next turn resumes.
+        bad = (r"""{"command": "python3 /tmp/curator.py render-native --input-json"""
+               r""" '{\"why\":\"Caveat: this is Berkopec'\''s report.\"}'"}""")
+        frame = "<tool_call>" + json.dumps({"id": "call_2", "type": "function", "function": {
+            "name": "terminal", "arguments": bad}}) + "</tool_call>"
+
+        def hermes_stores(reply):
+            # Hermes repairs arguments only when json.loads fails
+            # (chat_completion_helpers._assemble_tool_calls); "{}" drops the reply.
+            try:
+                from agent.message_sanitization import _repair_tool_call_arguments
+            except ImportError:
+                return reply
+
+            def stored(arguments, name):
+                try:
+                    json.loads(arguments)
+                    return arguments
+                except ValueError:
+                    return _repair_tool_call_arguments(arguments, name)
+            calls = [dict(c, function=dict(c["function"], arguments=stored(
+                c["function"]["arguments"], c["function"]["name"]))) for c in reply["tool_calls"]]
+            return dict(reply, tool_calls=calls)
+
+        with self.assertLogs("prompt", level="INFO") as repairs:
+            c1, logs = self._resume_after(frame, hermes_stores)
+        delivered = c1.choices[0].message.tool_calls[0].function.arguments
+        self.assertEqual(json.loads(delivered)["command"],
+                         "python3 /tmp/curator.py render-native --input-json"
+                         " '{\"why\":\"Caveat: this is Berkopec'\\''s report.\"}'")
+        self.assertEqual(hermes_stores(self._reply(c1)), self._reply(c1), "Hermes keeps the repair as is")
+        self.assertEqual(len([m for m in repairs.output if "Repaired shell/Python quote escapes" in m]), 1,
+                         repairs.output)
+        self._assert_resumed(logs)
 
     def test_effort_change_respawns_with_conversation_not_refresh(self):
         client = self._client()
