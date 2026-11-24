@@ -1395,28 +1395,61 @@ def _extract_tagged_tool_calls(
 
 
 _JSON_ESCAPES = frozenset('"\\/bfnrtu')
-_SHELL_DQ_QUOTE = "'\"'\"'"  # the shell idiom for ' inside single quotes: '"'"'
+_JSON_WHITESPACE = " \t\n\r"
+_AFTER_CLOSING_QUOTE = frozenset(_JSON_WHITESPACE + ",:}]")
+_BEFORE_OPENING_QUOTE = frozenset("{[,:")
+
+
+def _is_stray_quote(text: str, index: int) -> bool:
+    """True when the ``"`` at *index* can be neither escaped, opening nor closing.
+
+    In valid JSON an unescaped ``"`` either opens a string (the previous
+    non-whitespace character is ``{``, ``[``, ``,`` or ``:``, or there is
+    none) or closes one (the next character is whitespace, ``,``, ``:``,
+    ``}`` or ``]``, or there is none). A quote that fits neither, and is not
+    escaped by an odd run of backslashes, is invalid wherever it stands, so
+    the only reading that can make the text valid has it as a literal ``"``
+    inside a string. Valid JSON therefore never contains one.
+    """
+    backslashes = 0
+    while index - backslashes > 0 and text[index - backslashes - 1] == "\\":
+        backslashes += 1
+    if backslashes % 2:
+        return False
+    after = text[index + 1 : index + 2]
+    if not after or after in _AFTER_CLOSING_QUOTE:
+        return False
+    before = index - 1
+    while before >= 0 and text[before] in _JSON_WHITESPACE:
+        before -= 1
+    return before >= 0 and text[before] not in _BEFORE_OPENING_QUOTE
 
 
 def _repair_quote_escapes(arguments: str) -> str | None:
-    """Repair shell or Python quote escapes the model wrote unescaped in JSON.
+    """Repair shell or Python quotes the model wrote unescaped in JSON.
 
     The model sometimes writes a terminal command or Python source into a
-    JSON string without escaping it for JSON: the shell idioms ``'\\''`` and
-    ``'"'"'`` or Python's ``\\'``. ``\\'`` is not a JSON escape and a bare
-    ``"`` ends the string, so the arguments do not parse and Hermes replaces
-    them with ``{}``. Inside JSON strings only, an invalid ``\\'`` becomes an
-    escaped backslash followed by ``'`` and ``'"'"'`` gets its two quotes
-    escaped, so the decoded value is exactly the text the model wrote (the
-    shell or Python still reads it as an apostrophe). Valid escapes such as
-    ``\\\\'`` are copied as they are.
+    JSON string without escaping it for JSON: a bare ``"`` such as Python's
+    ``'"'`` or the shell idiom ``'"'"'``, or an invalid ``\\'`` from Python
+    or the shell idiom ``'\\''``. A bare ``"`` ends the string and ``\\'`` is
+    not a JSON escape, so the arguments do not parse and Hermes replaces them
+    with ``{}``. Each stray quote (:func:`_is_stray_quote`, which cannot be
+    structural in any valid reading) gets a backslash, and inside JSON
+    strings an invalid ``\\'`` becomes an escaped backslash followed by
+    ``'``, so the decoded value is exactly the text the model wrote. Valid
+    escapes such as ``\\\\'`` are copied as they are. A bare ``"`` next to
+    JSON punctuation (``print("a", "b")``) could be structure, so it is left
+    alone and such arguments stay unparseable.
 
     Returns the repaired arguments when they parse as JSON, else None.
     Callers try this only after ``json.loads`` of the original has failed.
     """
+    stray = [i for i, char in enumerate(arguments) if char == '"' and _is_stray_quote(arguments, i)]
+    for index in reversed(stray):
+        arguments = arguments[:index] + "\\" + arguments[index:]
     out: list[str] = []
     in_string = False
-    changed = 0
+    changed = len(stray)
     index, size = 0, len(arguments)
     while index < size:
         char = arguments[index]
@@ -1434,12 +1467,6 @@ def _repair_quote_escapes(arguments: str) -> str | None:
             else:
                 return None
             index += 2
-        elif arguments.startswith(_SHELL_DQ_QUOTE, index):
-            # A '"' followed by ' cannot close a JSON string, so this only
-            # matches where the original is already invalid.
-            out.append("'\\\"'\\\"'")
-            changed += 1
-            index += len(_SHELL_DQ_QUOTE)
         else:
             in_string = char != '"'
             out.append(char)

@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from prompt import _has_unfinished_tool_call_frame, _parse_tool_block
+from prompt import _has_unfinished_tool_call_frame, _is_stray_quote, _parse_tool_block
 from stream import AntigravityStream
 
 TOOL_CALL_CLOSE = "</tool_call>"
@@ -785,7 +785,9 @@ def test_valid_arguments_are_never_changed(value, caplog):
         r"""{"command":"echo it\'s""",                          # truncated
         r"""{"command":"echo it\'s \q"}""",                     # another invalid escape
         r"""{"command":"echo it\'s",}x""",                      # still invalid after the repair
-        r"""{"command":"echo 'it'"'"s'"}""",                    # '"'" without the closing quote
+        r"""{"code":"print("a", "b")"}""",                      # bare quotes next to JSON punctuation
+        r"""{"code":"d = {"a": 1}"}""",                         # could be structure: left alone
+        r"""{"code":"x = '",'"}""",                              # a quote before a comma
         r"""{"a": 1, '"'"' : 2}""",                              # the idiom outside a string
         "{\"code\":\"x = 'Jack\\'s'\n\"}",                       # \' plus a raw newline
         "not json at all",
@@ -796,3 +798,71 @@ def test_unrepairable_arguments_pass_through_untouched(arguments, caplog):
     with caplog.at_level(logging.INFO, logger="prompt"):
         assert _args_after_parse(arguments) == arguments
     assert caplog.records == []
+
+
+# -- stray double quotes in tool-call arguments ---------------------------------
+# News 07:34-07:47 (2026-11-23): Python source in execute_code where the model
+# escaped every double quote for JSON except the one inside a single-quoted
+# literal ('"' and '    "'). Each excerpt is cut verbatim from the real
+# arguments Hermes replaced with {}; the expected code is the literal reading.
+
+_NEWS_1123_CASES = [
+    pytest.param(
+        '{"code": "        # Body fragments\\n        m_body = re.search(r\'^### Resolved body.*?\\\\n((?:>.*?\\\\n)*)((?:    .+\\\\n?)+)\', blk, re.M)\\n        body_parts = []\\n        if m_body:\\n            for l in m_body.group(2).splitlines():\\n                s = l.strip()\\n                if s.startswith(\'"\'):\\n                    try: body_parts.append(json.loads(s))\\n                    except Exception: pass\\n        body = \'\'.join(body_parts)\\nprint(\'=== ALL 16 NEWSLETTERS ===\')\\nfor i, d in enumerate(all_docs, 1):\\n    print(f\\"{i:02d}. [{d[\'pub\']}] {d[\'site\']} | {d[\'id\']} | {len(d[\'clean\']):5d} chars | {d[\'title\']}\\")\\n"}',
+        '        # Body fragments\n        m_body = re.search(r\'^### Resolved body.*?\\n((?:>.*?\\n)*)((?:    .+\\n?)+)\', blk, re.M)\n        body_parts = []\n        if m_body:\n            for l in m_body.group(2).splitlines():\n                s = l.strip()\n                if s.startswith(\'"\'):\n                    try: body_parts.append(json.loads(s))\n                    except Exception: pass\n        body = \'\'.join(body_parts)\nprint(\'=== ALL 16 NEWSLETTERS ===\')\nfor i, d in enumerate(all_docs, 1):\n    print(f"{i:02d}. [{d[\'pub\']}] {d[\'site\']} | {d[\'id\']} | {len(d[\'clean\']):5d} chars | {d[\'title\']}")\n',
+        id='news-0734',
+    ),
+    pytest.param(
+        '{"code":"            for line in fm.group(1).splitlines():\\n                s = line.strip()\\n                if s.startswith(\'"\'):\\n                    try:\\n                        chunks.append(json.loads(s))\\n                    except Exception:\\n                        chunks.append(s)\\n            return \'\'.join(chunks)\\n"}',
+        '            for line in fm.group(1).splitlines():\n                s = line.strip()\n                if s.startswith(\'"\'):\n                    try:\n                        chunks.append(json.loads(s))\n                    except Exception:\n                        chunks.append(s)\n            return \'\'.join(chunks)\n',
+        id='news-0740',
+    ),
+    pytest.param(
+        '{"code":"        if in_field:\\n            if l.startswith(\'    "\'):\\n                try:\\n                    out.append(json.loads(l.strip()))\\n                except Exception:\\n                    out.append(l.strip())\\n            elif l.startswith(\'    null\'):\\n                return None\\n            else:\\n                break\\n    print(f\'\\\\n--- [{c[\\"watchlist_id\\"]}] {c[\\"watchlist_label\\"]} ---\')\\n"}',
+        '        if in_field:\n            if l.startswith(\'    "\'):\n                try:\n                    out.append(json.loads(l.strip()))\n                except Exception:\n                    out.append(l.strip())\n            elif l.startswith(\'    null\'):\n                return None\n            else:\n                break\n    print(f\'\\n--- [{c["watchlist_id"]}] {c["watchlist_label"]} ---\')\n',
+        id='news-0746',
+    ),
+    pytest.param(
+        '{"code":"        if capturing:\\n            if line.startswith(\'    "\'):\\n                try:\\n                    out.append(json.loads(line.strip()))\\n                except Exception:\\n                    out.append(line.strip())\\n            elif line.startswith(\'    null\'):\\n                return None\\n            elif line.startswith(\'> \'):\\n                continue\\n            else:\\n                break\\n"}',
+        '        if capturing:\n            if line.startswith(\'    "\'):\n                try:\n                    out.append(json.loads(line.strip()))\n                except Exception:\n                    out.append(line.strip())\n            elif line.startswith(\'    null\'):\n                return None\n            elif line.startswith(\'> \'):\n                continue\n            else:\n                break\n',
+        id='news-0747',
+    ),
+]
+
+
+@pytest.mark.parametrize("arguments, code", _NEWS_1123_CASES)
+def test_stray_double_quotes_in_execute_code_are_repaired(arguments, code, caplog):
+    with pytest.raises(ValueError):
+        json.loads(arguments)
+
+    with caplog.at_level(logging.INFO, logger="prompt"):
+        repaired = _args_after_parse(arguments, "execute_code")
+
+    assert json.loads(repaired) == {"code": code}
+    assert "startswith('\"')" in code or "startswith('    \"')" in code
+    assert [r.getMessage() for r in caplog.records] == [
+        f"Repaired shell/Python quote escapes in execute_code tool-call arguments ({len(arguments)} chars)"]
+
+
+@pytest.mark.parametrize(
+    "arguments, value",
+    [
+        (r"""{"command":"echo 'it'"'"s'"}""", "echo 'it'\"'\"s'"),     # '"'" without the closing quote
+        (r"""{"code":"print("hi")"}""", 'print("hi")'),                 # both quotes stray
+        (r"""{"code":"x = '\\"'"}""", "x = '\\\"'"),                   # an escaped backslash, then a bare quote
+        (r"""{"code":"m = re.match('"'), s\'"}""", "m = re.match('\"'), s\\'"),  # with \' in the same value
+    ],
+)
+def test_stray_quotes_decode_to_the_text_written(arguments, value):
+    with pytest.raises(ValueError):
+        json.loads(arguments)
+    assert list(json.loads(_args_after_parse(arguments)).values()) == [value]
+
+
+@pytest.mark.parametrize("arguments, code", _NEWS_1123_CASES)
+def test_valid_json_never_has_a_stray_quote(arguments, code):
+    values = [code, "echo 'it'\"'\"s'", 'a "quoted" word', '\\"', '"', "", "{\"k\": [\"v\"]}"]
+    for doc in (json.dumps({"code": code}), json.dumps({"code": code}, indent=2),
+                json.dumps({"a": values, "b": {"c": values}}), json.dumps(values, ensure_ascii=False),
+                json.dumps(values, separators=(",", ":"))):
+        assert [i for i, ch in enumerate(doc) if ch == '"' and _is_stray_quote(doc, i)] == []
