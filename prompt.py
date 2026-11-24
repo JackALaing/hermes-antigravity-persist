@@ -1394,7 +1394,8 @@ def _extract_tagged_tool_calls(
     return calls, "\n".join(part.strip() for part in text_parts if part and part.strip()).strip()
 
 
-_JSON_ESCAPES = frozenset('"\\/bfnrtu')
+_JSON_ESCAPES = frozenset('"\\/bfnrt')
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 _JSON_WHITESPACE = " \t\n\r"
 _AFTER_CLOSING_QUOTE = frozenset(_JSON_WHITESPACE + ",:}]")
 _BEFORE_OPENING_QUOTE = frozenset("{[,:")
@@ -1425,31 +1426,54 @@ def _is_stray_quote(text: str, index: int) -> bool:
     return before >= 0 and text[before] not in _BEFORE_OPENING_QUOTE
 
 
+def _is_json_escape(text: str, index: int) -> bool:
+    """True when the backslash at *index* starts a valid JSON escape."""
+    follower = text[index + 1 : index + 2]
+    if follower == "u":
+        digits = text[index + 2 : index + 6]
+        return len(digits) == 4 and all(digit in _HEX_DIGITS for digit in digits)
+    return bool(follower) and follower in _JSON_ESCAPES
+
+
 def _repair_quote_escapes(arguments: str) -> str | None:
-    """Repair shell or Python quotes the model wrote unescaped in JSON.
+    """Repair quotes and backslashes the model wrote unescaped in JSON.
 
     The model sometimes writes a terminal command or Python source into a
     JSON string without escaping it for JSON: a bare ``"`` such as Python's
-    ``'"'`` or the shell idiom ``'"'"'``, or an invalid ``\\'`` from Python
-    or the shell idiom ``'\\''``. A bare ``"`` ends the string and ``\\'`` is
-    not a JSON escape, so the arguments do not parse and Hermes replaces them
-    with ``{}``. Each stray quote (:func:`_is_stray_quote`, which cannot be
-    structural in any valid reading) gets a backslash, and inside JSON
-    strings an invalid ``\\'`` becomes an escaped backslash followed by
-    ``'``, so the decoded value is exactly the text the model wrote. Valid
-    escapes such as ``\\\\'`` are copied as they are. A bare ``"`` next to
-    JSON punctuation (``print("a", "b")``) could be structure, so it is left
-    alone and such arguments stay unparseable.
+    ``'"'`` or the shell idiom ``'"'"'``, or a backslash that does not start
+    a JSON escape, such as ``\\'`` (Python, or the shell idiom ``'\\''``) or
+    a regex ``\\(``, ``\\s`` or ``\\.``. A bare ``"`` ends the string and
+    ``\\X`` is not a JSON escape, so the arguments do not parse and Hermes
+    replaces them with ``{}``. Each stray quote (:func:`_is_stray_quote`,
+    which cannot be structural in any valid reading) gets a backslash, and
+    inside JSON strings each backslash that does not start a JSON escape is
+    doubled, so those characters decode to exactly the text the model wrote.
+
+    Valid JSON escapes keep their JSON meaning, as in any valid call: when the
+    model also wrote ``\\n`` meaning a literal backslash-n, the decoded text
+    has a newline there, and nothing here can tell which was meant. One such
+    escape is refused instead: a ``\\b`` in arguments that also need a
+    backslash doubled, because there it is almost always a regex word
+    boundary and decoding it as a backspace character would make the command
+    quietly wrong rather than fail. A bare ``"`` next to JSON punctuation
+    (``print("a", "b")``) could be structure, so it is left alone and such
+    arguments stay unparseable.
 
     Returns the repaired arguments when they parse as JSON, else None.
     Callers try this only after ``json.loads`` of the original has failed.
     """
     stray = [i for i, char in enumerate(arguments) if char == '"' and _is_stray_quote(arguments, i)]
-    for index in reversed(stray):
-        arguments = arguments[:index] + "\\" + arguments[index:]
+    if stray:
+        pieces, start = [], 0
+        for index in stray:
+            pieces.append(arguments[start:index])
+            start = index
+        pieces.append(arguments[start:])
+        arguments = "\\".join(pieces)
     out: list[str] = []
     in_string = False
-    changed = len(stray)
+    doubled = 0
+    backspace = False
     index, size = 0, len(arguments)
     while index < size:
         char = arguments[index]
@@ -1459,19 +1483,20 @@ def _repair_quote_escapes(arguments: str) -> str | None:
             index += 1
         elif char == "\\":
             follower = arguments[index + 1 : index + 2]
-            if follower == "'":
-                out.append("\\\\'")
-                changed += 1
-            elif follower and follower in _JSON_ESCAPES:
-                out.append(char + follower)
-            else:
+            if not follower:
                 return None
+            if _is_json_escape(arguments, index):
+                out.append(char + follower)
+                backspace = backspace or follower == "b"
+            else:
+                out.append("\\\\" + follower)
+                doubled += 1
             index += 2
         else:
             in_string = char != '"'
             out.append(char)
             index += 1
-    if not changed:
+    if not (stray or doubled) or (doubled and backspace):
         return None
     repaired = "".join(out)
     try:
@@ -1481,11 +1506,58 @@ def _repair_quote_escapes(arguments: str) -> str | None:
     return repaired
 
 
-def _repaired_arguments(name: str, arguments: str) -> str:
-    """``arguments`` unchanged when they parse, else a narrow quote-escape repair.
+_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
-    Anything the repair cannot turn into valid JSON passes through untouched,
-    so Hermes' own argument handling still applies to it.
+
+def _tool_parameters(tools: Sequence[Any] | None) -> dict[str, frozenset[str]]:
+    """Top-level parameter names by tool name, for tools whose schema lists them."""
+    names: dict[str, frozenset[str]] = {}
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function", tool)
+        if not isinstance(fn, dict) or not isinstance(fn.get("name"), str):
+            continue
+        params = fn.get("parameters")
+        props = params.get("properties") if isinstance(params, dict) else None
+        if isinstance(props, dict) and props:
+            names[fn["name"].strip()] = frozenset(props)
+    return names
+
+
+def _keys_fit(repaired: str, params: frozenset[str] | None) -> bool:
+    """True when *repaired* reads as a plausible argument object.
+
+    A repair that parses with the wrong structure usually shows it in its
+    keys: a fragment of the value read as a key, or a key read twice. The
+    result must be an object with no duplicate keys at any depth, and each
+    top-level key must be a parameter of the called tool when its schema
+    lists them, else identifier-shaped.
+    """
+    duplicate = False
+
+    def pairs_hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        nonlocal duplicate
+        duplicate = duplicate or len({key for key, _ in pairs}) != len(pairs)
+        return dict(pairs)
+
+    value = json.loads(repaired, object_pairs_hook=pairs_hook)
+    if duplicate or not isinstance(value, dict):
+        return False
+    if params is not None:
+        return all(key in params for key in value)
+    return all(_IDENTIFIER.fullmatch(key) for key in value)
+
+
+def _repaired_arguments(
+    name: str, arguments: str, tool_params: dict[str, frozenset[str]] | None = None
+) -> str:
+    """``arguments`` unchanged when they parse, else a narrow escape repair.
+
+    The repair is kept only if its keys fit (:func:`_keys_fit`), checked
+    against ``tool_params[name]`` when the called tool's schema is known.
+    Anything else passes through untouched, so Hermes' own argument handling
+    still applies to it.
     """
     try:
         json.loads(arguments)
@@ -1495,18 +1567,28 @@ def _repaired_arguments(name: str, arguments: str) -> str:
     repaired = _repair_quote_escapes(arguments)
     if repaired is None:
         return arguments
-    logger.info("Repaired shell/Python quote escapes in %s tool-call arguments (%d chars)",
+    if not _keys_fit(repaired, (tool_params or {}).get(name)):
+        logger.info("Declined an escape repair of %s tool-call arguments (%d chars): "
+                    "its keys do not fit the tool", name, len(arguments))
+        return arguments
+    logger.info("Repaired unescaped quotes or backslashes in %s tool-call arguments (%d chars)",
                 name, len(arguments))
     return repaired
 
 
 def _parse_tool_block(
-    block: str, state: _MarkdownCodeState | None = None, *, repair: bool = True
+    block: str,
+    state: _MarkdownCodeState | None = None,
+    *,
+    repair: bool = True,
+    tool_params: dict[str, frozenset[str]] | None = None,
 ) -> tuple[list[Any], str]:
     """Parse tool call blocks, returning (tool_call_deltas, cleaned_text).
 
     ``repair`` applies :func:`_repaired_arguments` to string arguments; callers
     that only read ``cleaned_text`` turn it off so a repair is logged once.
+    ``tool_params`` (:func:`_tool_parameters` of the request's tools) lets
+    the repair check its keys against the called tool's schema.
     """
     calls: list[Any] = []
     cleaned_text = ""
@@ -1527,7 +1609,7 @@ def _parse_tool_block(
         if not isinstance(args, str):
             args = json.dumps(args, ensure_ascii=False)
         elif repair:
-            args = _repaired_arguments(name, args)
+            args = _repaired_arguments(name, args, tool_params)
         deltas.append(
             SimpleNamespace(
                 index=i,

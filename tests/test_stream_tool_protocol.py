@@ -16,7 +16,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from prompt import _has_unfinished_tool_call_frame, _is_stray_quote, _parse_tool_block
+from prompt import (
+    _has_unfinished_tool_call_frame,
+    _is_stray_quote,
+    _parse_tool_block,
+    _repaired_arguments,
+    _tool_parameters,
+)
 from stream import AntigravityStream
 
 TOOL_CALL_CLOSE = "</tool_call>"
@@ -679,9 +685,9 @@ def test_prose_ending_with_lone_angle_bracket_after_a_complete_call_succeeds():
 # escaping them for JSON (News 08:17-08:20 and Chief 18:17, 2026-11-21). Each
 # excerpt keeps the real call's shape; Hermes replaced the originals with {}.
 
-def _args_after_parse(arguments: str, name: str = "terminal") -> str:
+def _args_after_parse(arguments: str, name: str = "terminal", tool_params=None) -> str:
     obj = {"id": "call_1", "type": "function", "function": {"name": name, "arguments": arguments}}
-    calls, _text = _parse_tool_block(f"<tool_call>{json.dumps(obj)}</tool_call>")
+    calls, _text = _parse_tool_block(f"<tool_call>{json.dumps(obj)}</tool_call>", tool_params=tool_params)
     assert len(calls) == 1
     return calls[0].function.arguments
 
@@ -738,7 +744,7 @@ def test_shell_quote_idioms_in_terminal_arguments_are_repaired(arguments, comman
     assert json.loads(repaired) == {"command": command}
     assert _curator_payload(command) == payload
     assert [r.getMessage() for r in caplog.records] == [
-        f"Repaired shell/Python quote escapes in terminal tool-call arguments ({len(arguments)} chars)"]
+        f"Repaired unescaped quotes or backslashes in terminal tool-call arguments ({len(arguments)} chars)"]
 
 
 def test_python_quote_escape_in_execute_code_arguments_is_repaired():
@@ -783,7 +789,6 @@ def test_valid_arguments_are_never_changed(value, caplog):
         r"""{\'command\': \'ls\'}""",                           # \' outside any string
         r"""{'command': 'ls'}""",                               # Python dict syntax
         r"""{"command":"echo it\'s""",                          # truncated
-        r"""{"command":"echo it\'s \q"}""",                     # another invalid escape
         r"""{"command":"echo it\'s",}x""",                      # still invalid after the repair
         r"""{"code":"print("a", "b")"}""",                      # bare quotes next to JSON punctuation
         r"""{"code":"d = {"a": 1}"}""",                         # could be structure: left alone
@@ -841,7 +846,7 @@ def test_stray_double_quotes_in_execute_code_are_repaired(arguments, code, caplo
     assert json.loads(repaired) == {"code": code}
     assert "startswith('\"')" in code or "startswith('    \"')" in code
     assert [r.getMessage() for r in caplog.records] == [
-        f"Repaired shell/Python quote escapes in execute_code tool-call arguments ({len(arguments)} chars)"]
+        f"Repaired unescaped quotes or backslashes in execute_code tool-call arguments ({len(arguments)} chars)"]
 
 
 @pytest.mark.parametrize(
@@ -866,3 +871,213 @@ def test_valid_json_never_has_a_stray_quote(arguments, code):
                 json.dumps({"a": values, "b": {"c": values}}), json.dumps(values, ensure_ascii=False),
                 json.dumps(values, separators=(",", ":"))):
         assert [i for i, ch in enumerate(doc) if ch == '"' and _is_stray_quote(doc, i)] == []
+
+
+# -- invalid escapes in tool-call arguments ----------------------------------
+# News 22:33-22:51 (2026-11-23): Python regexes in execute_code with their
+# backslashes left single (\(, \), \s, \.), which are not JSON escapes.
+# Excerpts are cut from the real arguments Hermes replaced with {} (paths
+# shortened). Each such backslash is doubled, so it decodes as written.
+
+_NEWS_1123_ESCAPE_CASES = [
+    pytest.param(
+        '{"code":"for i in range(3):\\n    log_path = f\'/tmp/task-{i}.log\'\\n    text = open(log_path, errors=\'replace\').read()\\n    # Check how task logs are structured\\n    m = re.search(r\'(?m)^# AI News|# Readwise|## 1\\.\', text)\\n    start = m.start() if m else max(0, len(text) - 8000)\\n    summary = text[start:]\\n"}',
+        "    m = re.search(r'(?m)^# AI News|# Readwise|## 1\\.', text)\n",
+        id="news-2240",
+    ),
+    pytest.param(
+        '{"code":"cron_log = open(\'/tmp/cron.md\').read()\\nshas = re.findall(r\'\\"sha256\\":\\s*\\"([0-9a-f]{64})\\"\', cron_log)\\nprint(\'sha256s in cron log:\', list(dict.fromkeys(shas)))\\n"}',
+        "shas = re.findall(r'\"sha256\":\\s*\"([0-9a-f]{64})\"', cron_log)\n",
+        id="news-2248",
+    ),
+    pytest.param(
+        '{"code":"cron_log = open(\'/tmp/cron.md\').read()\\nshas = re.findall(r\'\\"sha256\\":\\s*\\"([0-9a-f]{64})\\"\', cron_log)\\nprint(\'=== sha256s in morning cron log ===\', shas[:10])\\n"}',
+        "shas = re.findall(r'\"sha256\":\\s*\"([0-9a-f]{64})\"', cron_log)\n",
+        id="news-2251",
+    ),
+]
+
+
+@pytest.mark.parametrize("arguments, line", _NEWS_1123_ESCAPE_CASES)
+def test_regex_backslashes_in_execute_code_are_repaired(arguments, line, caplog):
+    with pytest.raises(ValueError):
+        json.loads(arguments)
+
+    with caplog.at_level(logging.INFO, logger="prompt"):
+        repaired = _args_after_parse(arguments, "execute_code", _tool_parameters(_HERMES_TOOLS))
+
+    code = json.loads(repaired)["code"]
+    assert line in code
+    compile(code, "<case>", "exec")
+    assert [r.getMessage() for r in caplog.records] == [
+        f"Repaired unescaped quotes or backslashes in execute_code tool-call arguments ({len(arguments)} chars)"]
+
+
+def test_valid_escapes_keep_their_json_meaning_beside_repaired_ones():
+    # News 22:33: the regex backslashes are repaired, but the model also
+    # wrote Python's \n escapes single (r'\n{3,}', '\n\n', f'\n...'), the
+    # same characters as the JSON \n it used for line breaks. They decode as
+    # newlines, so this source does not compile; nothing tells which \n the
+    # model meant, and Python reports the error instead of running it.
+    arguments = '{"code":"def summarize_md(path, label, max_chars=2600):\\n    t = open(path).read()\\n    # Strip huge tracking URLs to keep text dense and readable\\n    t_clean = re.sub(r\'\\(https?://[^\\)\\s]{60,}\\)\', \'(URL)\', t)\\n    t_clean = re.sub(r\'\\n{3,}\', \'\\n\\n\', t_clean)\\n    print(f\'\\n================ {label} (orig={len(t)}) ================\')\\n    print(t_clean[:max_chars])\\n"}'
+    code = json.loads(_args_after_parse(arguments, "execute_code"))["code"]
+
+    assert "    t_clean = re.sub(r'\\(https?://[^\\)\\s]{60,}\\)', '(URL)', t)\n" in code
+    assert "    t_clean = re.sub(r'\n{3,}', '\n\n', t_clean)\n" in code
+    with pytest.raises(SyntaxError):
+        compile(code, "<case>", "exec")
+
+
+@pytest.mark.parametrize(
+    "arguments, value",
+    [
+        (r"""{"command":"echo it\'s \q"}""", "echo it\\'s \\q"),
+        (r"""{"command":"dir C:\users\me"}""", "dir C:\\users\\me"),      # \u without four hex digits
+        (r"""{"command":"echo \u12"}""", "echo \\u12"),
+        (r"""{"command":"grep -E '\s\u00e9\d'"}""", "grep -E '\\s\u00e9\\d'"),  # \u00e9 is valid: é
+        (r"""{"command":"x\(\n\t\/\\\"y"}""", 'x\\(\n\t/\\"y'),     # only \( is doubled
+    ],
+)
+def test_invalid_escapes_decode_to_the_text_written(arguments, value):
+    with pytest.raises(ValueError):
+        json.loads(arguments)
+    assert json.loads(_args_after_parse(arguments)) == {"command": value}
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        # News 22:40 and 23:01: bare quotes beside a comma or a space could be
+        # structure, so these stay unparseable.
+        '{"code":"for i, x in enumerate(rss.get(\'entries\', []), 1):\\n    s = (x.get(\'summary\') or x.get(\'description\') or x.get(\'excerpt\') or \'\').replace(\'\\n\', \' \')[:260]\\n    print(f\'{i:2d}. [{x.get("source_id")}] {x.get("title")} | ref={x.get("ref_id","")[:12]} | {s}\')\\n"}',
+        '{"code":"print(f\'Removed {removed_x} accepted X lines; x_decisions count: {len(x_decisions)} (accept={sum(v=="accept" for v in x_decisions.values())}, defer={sum(v=="defer" for v in x_decisions.values())})\')\\n"}',
+        r"""{"code":"re.findall(r'\b\d{4}\b', s)"}""",     # \b beside a doubled escape: a regex boundary
+        r"""{"command":"echo \q"} trailing""",
+        r"""{"command":"echo \q""",                          # truncated
+        "{\"command\":\"echo \\q\n\"}",                     # \q plus a raw newline
+        "{\"command\":\"echo \\",                           # ends inside an escape
+    ],
+)
+def test_escape_near_misses_pass_through_untouched(arguments, caplog):
+    with caplog.at_level(logging.INFO, logger="prompt"):
+        assert _args_after_parse(arguments, "execute_code") == arguments
+    assert caplog.records == []
+
+
+# -- the key guard on repairs --------------------------------------------------
+# A repair that parses with the wrong structure shows it in its keys.
+
+_HERMES_TOOLS = [
+    {"type": "function", "function": {"name": "terminal", "parameters": {
+        "type": "object", "properties": {"command": {}, "timeout": {}, "workdir": {}}}}},
+    {"type": "function", "function": {"name": "execute_code", "parameters": {
+        "type": "object", "properties": {"code": {}, "reset": {}}}}},
+    {"type": "function", "function": {"name": "no_schema"}},
+]
+
+_WRONG_STRUCTURE = r"""{"command":"s = \'", "code": "\'\nif s.startswith(\'"\'):","timeout":60}"""
+
+
+def test_tool_parameters_reads_listed_properties_only():
+    assert _tool_parameters(_HERMES_TOOLS + [None, {"function": "x"}, {"name": "flat", "parameters": {
+        "properties": {"a": {}}}}]) == {
+        "terminal": frozenset({"command", "timeout", "workdir"}),
+        "execute_code": frozenset({"code", "reset"}),
+        "flat": frozenset({"a"}),
+    }
+    assert _tool_parameters(None) == {}
+
+
+def test_repair_with_a_key_outside_the_schema_is_declined(caplog):
+    params = _tool_parameters(_HERMES_TOOLS)
+    with caplog.at_level(logging.INFO, logger="prompt"):
+        assert _args_after_parse(_WRONG_STRUCTURE, "terminal", params) == _WRONG_STRUCTURE
+    assert [r.getMessage() for r in caplog.records] == [
+        f"Declined an escape repair of terminal tool-call arguments ({len(_WRONG_STRUCTURE)} chars): "
+        "its keys do not fit the tool"]
+    # Without a schema for the tool, identifier-shaped keys are all it can check.
+    assert json.loads(_args_after_parse(_WRONG_STRUCTURE, "no_schema", params)).keys() == {
+        "command", "code", "timeout"}
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        r"""{"code":"a = \'", "code": "\'\nif s.startswith(\'"\'):"}""",   # a key read twice
+        r"""{"command":"echo it\'s","env":{"A":"1","A":"2"}}""",          # a nested duplicate
+        r"""{"code":"x = \'", "a b": "\'\nif s.startswith(\'"\'):"}""",   # not identifier-shaped
+        r"""["echo it\'s"]""",                                           # not an object
+    ],
+)
+def test_repairs_with_implausible_keys_are_declined(arguments):
+    with pytest.raises(ValueError):
+        json.loads(arguments)
+    assert _args_after_parse(arguments, "no_schema") == arguments
+
+
+def test_stream_checks_repairs_against_the_request_tools():
+    def call(name, arguments):
+        return "<tool_call>" + json.dumps(
+            {"id": name, "type": "function", "function": {"name": name, "arguments": arguments}}) + "</tool_call>"
+
+    real = _NEWS_1123_ESCAPE_CASES[0].values[0]
+    stream = AntigravityStream(
+        proc=_proc([json.dumps(e) for e in _events(call("terminal", _WRONG_STRUCTURE), call("execute_code", real))]),
+        client=MagicMock(_isolated_gemini_dir=None), model="fixture-only", timeout=5.0, tools=_HERMES_TOOLS,
+    )
+
+    calls, _contents, _finishes = _consumed(list(stream))
+
+    assert calls[0].function.arguments == _WRONG_STRUCTURE
+    assert "re.search(r'(?m)^# AI News|# Readwise|## 1\\.', text)" in json.loads(calls[1].function.arguments)["code"]
+
+
+# -- fuzz: valid JSON is never changed, invalid escapes decode as written -----
+
+_FUZZ_ALPHABET = ['"', "'", "\\", "\\n", "\\u", "\\b", " ", "\t", "\n", ",", ":", "{", "}", "[", "]",
+                  "a", "s", "(", ")", ".", "u", "0", "e", "\x01", "\x0c", "é", "\ud83d"]
+
+
+def test_fuzz_valid_json_arguments_are_never_changed():
+    import random
+
+    rng = random.Random(2311)
+
+    def text():
+        return "".join(rng.choice(_FUZZ_ALPHABET) for _ in range(rng.randint(0, 12)))
+
+    def value(depth=0):
+        roll = rng.random()
+        if depth > 3 or roll < 0.5:
+            return text()
+        if roll < 0.6:
+            return rng.choice([0, -1.5, True, None])
+        if roll < 0.8:
+            return [value(depth + 1) for _ in range(rng.randint(0, 3))]
+        return {text(): value(depth + 1) for _ in range(rng.randint(0, 3))}
+
+    for _ in range(3000):
+        obj = {"command": value(), text(): value()}
+        for doc in (json.dumps(obj), json.dumps(obj, ensure_ascii=False, indent=rng.choice([None, 2])),
+                    json.dumps(obj, separators=(",", ":")), json.dumps([obj, value()])):
+            assert _repaired_arguments("terminal", doc, _tool_parameters(_HERMES_TOOLS)) == doc
+
+
+def test_fuzz_single_backslashes_before_non_escapes_decode_as_written():
+    import random
+
+    rng = random.Random(2312)
+    pieces = ["a", " ", "(", ")", ".", "'", "x = 1", "\\(", "\\)", "\\s", "\\d", "\\.", "\\'", "\\w",
+              "\\$", "\\|", "\\[", "\\]", "\\{", "\\}", "\\-", "\\ ", "\\user", "\\g<1>", "é"]
+    for _ in range(3000):
+        written = "".join(rng.choice(pieces) for _ in range(rng.randint(1, 12)))
+        arguments = '{"code":"' + written + '"}'
+        assert json.loads(_repaired_arguments("execute_code", arguments)) == {"code": written}
+
+
+def test_many_stray_quotes_repair_in_linear_time():
+    arguments = '{"content":"' + 'a"b ' * 60000 + '"}'
+    started = time.perf_counter()
+    repaired = _repaired_arguments("write_file", arguments)
+    assert json.loads(repaired) == {"content": 'a"b ' * 60000}
+    assert time.perf_counter() - started < 2.0

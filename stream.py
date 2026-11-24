@@ -27,6 +27,7 @@ try:
         _has_unparseable_tool_call_frame,
         _longest_tool_call_prefix_match,
         _parse_tool_block,
+        _tool_parameters,
         media_reference_paths,
     )
 except ImportError:
@@ -41,6 +42,7 @@ except ImportError:
         _has_unparseable_tool_call_frame,
         _longest_tool_call_prefix_match,
         _parse_tool_block,
+        _tool_parameters,
         media_reference_paths,
     )
 
@@ -365,6 +367,7 @@ class AntigravityStream(Iterator[Any]):
         self.model = model
         self.timeout = timeout
         self.has_tools = bool(tools)
+        self.tool_params = _tool_parameters(tools)
         self.is_worker = is_worker
         self.worker_lock = worker_lock
         self.messages = messages
@@ -1097,7 +1100,9 @@ class AntigravityStream(Iterator[Any]):
                                         block = text_buffer[:full_end]
                                         text_buffer = text_buffer[full_end:]
                                         in_tool_call = False
-                                        parsed_calls, extra_text = _parse_tool_block(block)
+                                        parsed_calls, extra_text = _parse_tool_block(
+                                            block, tool_params=self.tool_params
+                                        )
                                         if (
                                             not parsed_calls
                                             and self.has_tools
@@ -1253,7 +1258,9 @@ class AntigravityStream(Iterator[Any]):
                 )
             if text_buffer and not has_tool_calls and not neutralized_tool_step:
                 if self.has_tools or "<tool_call>" in text_buffer:
-                    parsed_calls, extra_text = _parse_tool_block(text_buffer, state=md_state)
+                    parsed_calls, extra_text = _parse_tool_block(
+                        text_buffer, state=md_state, tool_params=self.tool_params
+                    )
                     if parsed_calls:
                         has_tool_calls = True
                         for call_delta in identify_calls(parsed_calls):

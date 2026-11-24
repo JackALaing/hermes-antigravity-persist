@@ -462,8 +462,9 @@ class PersistentSessionTests(unittest.TestCase):
         # Chief 18:17 and News 08:17-08:20 (2026-11-21): the model wrote tool
         # arguments Hermes could not repair, so Hermes discarded the reply and
         # sent the same request again. agy's conversation holds that reply.
-        # (The fork now repairs those quote escapes; \q is not one of them.)
-        bad = r"""{"code":"print('C:\qdir')\n"}"""
+        # (The fork now repairs those escapes; bare quotes beside a comma,
+        # which could be JSON structure, are not repaired.)
+        bad = r"""{"code":"print("a", "b")\n"}"""
         frame = "<tool_call>" + json.dumps({"id": "call_9", "type": "function", "function": {
             "name": "execute_code", "arguments": bad}}) + "</tool_call>"
         client = self._client()
@@ -515,7 +516,7 @@ class PersistentSessionTests(unittest.TestCase):
                          "python3 /tmp/curator.py render-native --input-json"
                          " '{\"why\":\"Caveat: this is Berkopec'\\''s report.\"}'")
         self.assertEqual(hermes_stores(self._reply(c1)), self._reply(c1), "Hermes keeps the repair as is")
-        self.assertEqual(len([m for m in repairs.output if "Repaired shell/Python quote escapes" in m]), 1,
+        self.assertEqual(len([m for m in repairs.output if "Repaired unescaped quotes or backslashes" in m]), 1,
                          repairs.output)
         self._assert_resumed(logs)
 
