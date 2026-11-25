@@ -61,6 +61,7 @@ try:
         terminate_process,
         write_media_read_permissions,
     )
+    from .custom_agent import custom_agent_args, note_custom_agent_rejection
     from .models import split_effort_suffix
     from .prompt import _latest_user_text
     from .stream import AntigravityStream, _StepUsage, _delta_worker_usage, cache_hit_pct
@@ -92,6 +93,7 @@ except ImportError:
         terminate_process,
         write_media_read_permissions,
     )
+    from custom_agent import custom_agent_args, note_custom_agent_rejection
     from models import split_effort_suffix
     from prompt import _latest_user_text
     from stream import AntigravityStream, _StepUsage, _delta_worker_usage, cache_hit_pct
@@ -326,6 +328,12 @@ class PersistentTurn:
         self._isolated_gemini_dir = store.gemini_dir
         self._messages = list(messages or [])
         self._system_hash = system_hash(self._messages)
+        # The plugin's custom agent (custom_agent.py) for this turn's spawns,
+        # set by resolve_agent() before the decision and at every spawn; the
+        # record keeps it. AntigravityStream reads _custom_agent_named.
+        self.agent_args: list[str] = []
+        self.agent = ""
+        self._custom_agent_named = False
         self.worker: _Worker | None = None
         self.seed_tokens = 0
         # This turn's seed outcome: a native-tool rejection (counted towards
@@ -405,6 +413,36 @@ class PersistentTurn:
                 self.abort("stream abandoned")
                 return
 
+    def resolve_agent(self) -> str:
+        """Name the custom agent for this turn's spawns ('' for agy's default).
+
+        Same rule as the per-client path (AntigravityClient._agent_args): an
+        agent named in ANTIGRAVITY_ARGS wins, and a refused agent is dropped
+        for the rest of the process. The definition is written into the
+        persistent home, where these spawns run.
+        """
+        client = self._client
+        args: list[str] = []
+        if not any(arg == "--agent" or arg.startswith("--agent=") for arg in client._args):
+            args = custom_agent_args(client._command, self._store.home)
+        self.agent_args = list(args)
+        self.agent = args[1] if len(args) > 1 else ""
+        self._custom_agent_named = bool(args)
+        return self.agent
+
+    def note_agent_rejection(self, detail: object, proc: subprocess.Popen | None = None) -> None:
+        """Stop naming the agent if agy refused it (its error or stderr says so)."""
+        if not self._custom_agent_named:
+            return
+        tail = ""
+        drainer = getattr(proc, "_stderr_drainer", None) if proc is not None else None
+        if drainer is not None and hasattr(drainer, "get_tail"):
+            try:
+                tail = drainer.get_tail(timeout=1.0) or ""
+            except Exception:
+                tail = ""
+        note_custom_agent_rejection(f"{detail}\n{tail}" if tail else detail)
+
     def _on_worker_turn_success(self, stream: AntigravityStream, step_usage: _StepUsage,
                                 usage_data: dict[str, Any]) -> None:
         self.commit(stream.reply_message(), step_usage, usage_data)
@@ -447,6 +485,7 @@ class PersistentTurn:
                 "model": _base_model(self._model),
                 "effort": self._effort,
                 "tools_hash": self._tools_hash,
+                "agent": self.agent,
                 "agy_size_tokens": size,
                 "hermes_size_tokens": self.hermes_tokens,
                 "needs_refresh": False,
@@ -514,7 +553,10 @@ class PersistentTurn:
         _kill_worker(self._registry_key, _registered(self._registry_key))
         client = self._client
         sync_isolated_token(self._store.home)
-        cmd = [client._command, "--input-format", "stream-json", *client._args]
+        # Asked at every spawn, as on the per-client path: an agent agy
+        # refused earlier in this turn is no longer named on the retry.
+        self.resolve_agent()
+        cmd = [client._command, "--input-format", "stream-json", *client._args, *self.agent_args]
         if conversation_id:
             cmd.extend(["--conversation", conversation_id])
         if self._model:
@@ -557,6 +599,9 @@ class PersistentTurn:
             return []
         worker.awaiting_init = False
         conversation_id, lines, failure = _await_init(worker.proc, deadline)
+        if failure:
+            # A spawn agy refuses for its agent exits with stderr only.
+            self.note_agent_rejection(failure, worker.proc)
         expected = worker.expected_conversation
         if expected is not None:
             if failure or conversation_id != expected:
@@ -611,6 +656,8 @@ class PersistentTurn:
         tokens = (steps.context_tokens + steps.output_sum) if steps.seen else 0
         self.seed_tokens += tokens
         failure = ack_failure(saw_result=saw_result, status=status, error=error, native_tool=native_tool)
+        if failure and not native_tool:
+            self.note_agent_rejection(error or failure, worker.proc)
         if failure:
             raise SeedRejected(f"Antigravity execution failed: context restore was not acknowledged ({failure})",
                                native_tool=native_tool)
@@ -682,8 +729,9 @@ def _start_turn(turn: PersistentTurn, store: PersistStore, key: str, record: dic
 
     # The resolved id carries the effort suffix; an effort change alone must
     # resume (respawning with --conversation), so compare the base model.
+    agent = turn.resolve_agent()
     decision = decide(record, messages, model=_base_model(model), tools_hash=turn._tools_hash,
-                      system_hash=turn._system_hash)
+                      system_hash=turn._system_hash, agent=agent)
     payloads: list[str] = []
     pending: list[str] = []
     if decision.resume:

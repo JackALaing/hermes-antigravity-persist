@@ -852,6 +852,7 @@ def decide(
     model: str,
     tools_hash: str,
     system_hash: str | None = None,
+    agent: str | None = None,
 ) -> Decision:
     """Resume the recorded agy conversation, or refresh, and why.
 
@@ -878,6 +879,10 @@ def decide(
         return Decision(False, "model changed")
     if record.get("tools_hash") != tools_hash:
         return Decision(False, "tools changed")
+    # The agent sets agy's own system prompt and native tools for the whole
+    # conversation; a record from before the agent field ran agy's default.
+    if agent is not None and (record.get("agent") or "") != agent:
+        return Decision(False, "agent changed")
     if system_hash is not None and refresh_on_system_change() and record.get("system_hash") != system_hash:
         return Decision(False, "system prompt changed")
     if int(record.get("agy_size_tokens") or 0) > refresh_size_tokens():

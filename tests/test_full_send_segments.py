@@ -470,6 +470,36 @@ class SegmentedSendTests(unittest.TestCase):
         self.assertEqual(len(proc.stdin.writes), 1)
         self.assertNotIn("[CONTEXT PART", self._contents(proc.stdin.writes)[0])
 
+    def test_claude_full_send_over_the_stdin_limit_is_packed_into_one_message(self):
+        # No split for Claude routes: the one message is packed under agy's
+        # stdin byte limit (persist.pack_oneshot), omitting older history.
+        from persist import MAX_STDIN_BYTES, utf8_len
+        os.environ.pop("HERMES_ANTIGRAVITY_SEGMENT_WEIGHT")
+        proc = _TurnProcess([_turn("fine", {"input_tokens": 5, "output_tokens": 1})])
+        self.pending.append(proc)
+        c = self._client()
+        big = _history()
+        big[1] = {"role": "user", "content": "OLD-HEAD " + _filler("huge", 6000)}  # ~330 KB
+        list(c.chat.completions.create(model="claude-opus-5-5-high", messages=big, stream=True))
+        self.assertEqual(len(proc.stdin.writes), 1)
+        sent = self._contents(proc.stdin.writes)[0]
+        self.assertLess(utf8_len(sent), MAX_STDIN_BYTES)
+        self.assertNotIn("[CONTEXT PART", sent)
+        self.assertNotIn("OLD-HEAD", sent)
+        self.assertIn("TAIL-CODE gamma-99", sent)
+
+    def test_a_part_over_the_stdin_limit_is_refused_before_it_is_written(self):
+        from persist import StdinPayloadTooLarge
+        os.environ["HERMES_ANTIGRAVITY_SEGMENT_WEIGHT"] = "10000000"  # one message, ~330 KB
+        proc = _TurnProcess([_turn("never", {"input_tokens": 5, "output_tokens": 1})])
+        self.pending.append(proc)
+        c = self._client()
+        big = _history()
+        big[1] = {"role": "user", "content": _filler("huge", 6000)}
+        with self.assertRaises(StdinPayloadTooLarge):
+            list(c.chat.completions.create(model=GEMINI, messages=big, stream=True))
+        self.assertEqual(proc.stdin.writes, [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -105,6 +105,14 @@ class FakeAgy:
     def on_message(self, content):
         self.received.append(content)
         self.world.conversations[self.conversation].append(content)
+        if self.first and self.world.refuse_agent and "--agent" in self.cmd:
+            # agy 1.5.16 refusing the agent it was asked for: a result event
+            # with status ERROR (the same text on stderr), then exit 3.
+            self.first = False
+            self._emit({"event": "result", "result": {
+                "status": "ERROR", "error": 'unknown agent "hermes-inference-backend"'}})
+            self.returncode = 3
+            return
         if self.first:
             self.first = False
             self._emit({"event": "init", "conversation_id": self.conversation,
@@ -149,6 +157,7 @@ class World:
         self.seed_status = "SUCCESS"
         self.seed_tool = False
         self.lose_conversations = False
+        self.refuse_agent = False
         self.no_step_usage = False
         # Step usage for real (non-seed) turns, to give agy's conversation a
         # chosen size; None keeps the per-message default.
@@ -491,6 +500,72 @@ class PersistentSessionTests(unittest.TestCase):
         self._create(client, m2, model="gemini-3.8-flash", effort="high")
         self.assertEqual(len(self.world.procs), 2)
         self.assertIn("--conversation", self.world.procs[1].cmd)
+
+    # -- custom agent (custom_agent.py) on the persistent home -------------
+    def _agent_supported(self, supported=True):
+        import custom_agent
+        version = custom_agent.MIN_AGY_VERSION if supported else None
+        return patch("custom_agent.agy_version", return_value=version)
+
+    def test_persistent_spawns_run_as_the_custom_agent_and_resume_with_it(self):
+        import custom_agent
+        with self._agent_supported():
+            self._two_turns(self._client())
+        worker = self.world.workers[0]
+        self.assertEqual(len(self.world.workers), 1, "the second turn resumed")
+        self.assertEqual(worker.cmd[worker.cmd.index("--agent") + 1], custom_agent.AGENT_NAME)
+        self.assertTrue(custom_agent.agent_path(self.store.home).is_file(),
+                        "the definition is written into the persistent home")
+        self.assertEqual(self._record()["agent"], custom_agent.AGENT_NAME)
+
+    def test_a_respawn_into_the_conversation_keeps_the_agent(self):
+        with self._agent_supported():
+            client = self._client()
+            m1 = [{"role": "user", "content": "q"}]
+            c1 = self._create(client, m1, effort="low")
+            self._create(client, m1 + [self._reply(c1), {"role": "user", "content": "more"}], effort="high")
+        self.assertEqual(len(self.world.workers), 2)
+        self.assertIn("--conversation", self.world.workers[1].cmd)
+        self.assertIn("--agent", self.world.workers[1].cmd)
+
+    def test_a_conversation_from_agys_default_agent_refreshes_once_the_agent_is_named(self):
+        client = self._client()
+        m1 = [{"role": "system", "content": "sys"}, {"role": "user", "content": "first question"}]
+        c1 = self._create(client, m1)
+        self.assertEqual(self._record()["agent"], "")
+        with self._agent_supported(), self.assertLogs(level="INFO") as logs:
+            self._create(client, m1 + [self._reply(c1), {"role": "user", "content": "second"}])
+        self.assertTrue([line for line in logs.output
+                         if line.endswith("Refreshing persistent agy conversation: agent changed")], logs.output)
+        self.assertNotIn("--agent", self.world.workers[0].cmd)
+        self.assertIn("--agent", self.world.workers[1].cmd)
+        self.assertNotIn("--conversation", self.world.workers[1].cmd)
+
+    def test_a_record_from_before_the_agent_field_resumes_on_the_default_agent(self):
+        client = self._client()
+        m1 = [{"role": "user", "content": "q"}]
+        c1 = self._create(client, m1)
+        record = self._record()
+        del record["agent"]
+        self.store.save(record)
+        with self.assertLogs(level="INFO") as logs:
+            self._create(client, m1 + [self._reply(c1), {"role": "user", "content": "more"}])
+        self.assertEqual([line for line in logs.output if "Refreshing persistent agy" in line], [])
+
+    def test_an_agent_agy_refuses_is_dropped_and_the_retry_runs_the_default_agent(self):
+        import custom_agent
+        self.world.refuse_agent = True
+        client = self._client()
+        m1 = [{"role": "user", "content": "q"}]
+        with self._agent_supported():
+            with self.assertRaises(RuntimeError):
+                self._create(client, m1)
+            self.assertTrue(custom_agent._rejected)
+            c1 = self._create(client, m1)
+        self.assertIn("--agent", self.world.workers[0].cmd)
+        self.assertNotIn("--agent", self.world.workers[-1].cmd)
+        self.assertTrue(c1.choices[0].message.content)
+        self.assertEqual(self._record()["agent"], "")
 
     # -- classification ------------------------------------------------------
     def test_side_calls_run_as_one_shots_and_leave_the_record(self):
