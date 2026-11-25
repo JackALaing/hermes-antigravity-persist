@@ -119,6 +119,57 @@ class LenientDecoderTests(unittest.TestCase):
             out = subprocess.run(["bash", "-c", command], capture_output=True, text=True)
             self.assertEqual(out.stdout.strip(), "1")
 
+    # News 08:17-08:20 and Chief 18:17 (2026-11-21): an escaped apostrophe
+    # the code needs, written without escaping its backslash for JSON. A plain
+    # ' there would end the string: kept, as the model wrote it.
+    _NEWS_1121 = [
+        (r"""{"command": "python3 /tmp/curator.py render-native --input-json '{\"what\":\"Caveat: this is Berkopec'\''s report of an OpenRouter email.\",\"why\":\"Charlie O'\''Neill shares a lesson; the authors'\'' own claims.\"}'"}""",
+         {"what": "Caveat: this is Berkopec's report of an OpenRouter email.",
+          "why": "Charlie O'Neill shares a lesson; the authors' own claims."}),
+        (r"""{"command":"python3 /tmp/curator.py render-native --input-json '{\"what\":\"Developer leoshen0 reports that Antigravity'\''s built-in prompt drives heavy upfront reads.\",\"why\":\"Based on the author'\''s report of an OpenRouter email.\"}'"}""",
+         {"what": "Developer leoshen0 reports that Antigravity's built-in prompt drives heavy upfront reads.",
+          "why": "Based on the author's report of an OpenRouter email."}),
+        (r"""{"command":"python3 /tmp/curator.py render-native --input-json '{\"what\":\"Decentralized Economy argues that Pearl'"'"'s \\\"useful work\\\" mining model is broken.\",\"why\":\"Verify OpenRouter'"'"'s official notice; the authors'"'"' own framing.\"}'"}""",
+         {"what": 'Decentralized Economy argues that Pearl\'s "useful work" mining model is broken.',
+          "why": "Verify OpenRouter's official notice; the authors' own framing."}),
+        (r"""{"command": "python3 /tmp/curator.py render-native --input-json '{\"what\":\"Hermes Release Watch highlights Nous Research'\''s official Advanced Delegation plugin.\",\"why\":\"Caveat: this is Berkopec'\''s report.\"}'"}""",
+         {"what": "Hermes Release Watch highlights Nous Research's official Advanced Delegation plugin.",
+          "why": "Caveat: this is Berkopec's report."}),
+    ]
+
+    def test_bash_apostrophe_idioms_keep_their_meaning(self):
+        import shlex
+        for raw, payload in self._NEWS_1121:
+            with self.subTest(payload["what"][:40]):
+                with self.assertRaises(json.JSONDecodeError):
+                    json.loads(raw)
+                args, error = _normalize_tool_arguments("terminal", raw, SCHEMAS)
+                self.assertIsNone(error)
+                argv = shlex.split(json.loads(args)["command"])
+                self.assertEqual(argv[:4], ["python3", "/tmp/curator.py", "render-native", "--input-json"])
+                self.assertEqual(json.loads(argv[4]), payload)
+
+    def test_python_apostrophe_escape_keeps_its_meaning(self):
+        raw = (r"""{"code":"line = ('\\t- Draft for Jack\'s approval. Awaiting Jack\'s approval on Dispatch.'"""
+               r""" + ' (Workhorse research)')\nprint(line)\n"}""")
+        args, error = _normalize_tool_arguments("execute_code", raw, None)
+        self.assertIsNone(error)
+        code = json.loads(args)["code"]
+        scope: dict = {}
+        exec(compile(code.replace("print(line)", ""), "<case>", "exec"), scope)
+        self.assertEqual(scope["line"],
+                         "\t- Draft for Jack's approval. Awaiting Jack's approval on Dispatch. (Workhorse research)")
+
+    def test_a_repair_that_reads_a_key_twice_is_withheld(self):
+        # Unescaped quotes can turn string text into structure; json.loads
+        # would keep the last value without a word.
+        for raw in (r"""{"code":"a = \'", "code": "\'\nif s.startswith(\'"\'):"}""",
+                    r"""{"command":"echo it\'s","env":{"A":"1","A":"2"}}"""):
+            with self.subTest(raw):
+                args, error = _normalize_tool_arguments("execute_code", raw, None)
+                self.assertEqual(args, raw)
+                self.assertIn("duplicate key", error)
+
     def test_bare_quotes_inside_a_string_are_escaped(self):
         value, fixes = _lenient_json_loads('{"command": "python -c "print(1)""}')
         self.assertEqual(value["command"], 'python -c "print(1)"')

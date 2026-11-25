@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import ipaddress
+import functools
 import json
 import logging
 import mimetypes
@@ -1567,6 +1568,36 @@ _MAX_JSON_FIXES = 200
 _MISSING_MEMBER_COMMA_RE = re.compile(r'\s*"[^"\\]*"\s*:')
 
 
+class _DuplicateKey(Exception):
+    pass
+
+
+def _unique_keys_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    obj: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in obj:
+            raise _DuplicateKey(key)
+        obj[key] = value
+    return obj
+
+
+def _is_code_apostrophe(s: str, slash: int) -> bool:
+    """True when the ``\\'`` at *slash* is an escape the code needs.
+
+    Between two letters or digits it is an apostrophe escaped for Python or
+    bash (``'Jack\\'s approval'``, ``echo it\\'s``); after and before a quote
+    it is bash's ``'\\''`` idiom for an apostrophe inside single quotes. A
+    plain ``'`` there would end the string (Chief 18:17 and News 08:17-08:20,
+    2026-11-21). Elsewhere (``sed \\'s/a/b/\\'``) it is a quote written by
+    habit.
+    """
+    before = s[slash - 1] if slash > 0 else ""
+    after = s[slash + 2] if slash + 2 < len(s) else ""
+    if before.isalnum() and after.isalnum():
+        return True
+    return before == "'" and after == "'"
+
+
 def _lenient_json_loads(text: str) -> tuple[Any, dict[str, int]]:
     """Decode JSON a model wrote by hand, fixing two escaping slips.
 
@@ -1580,7 +1611,10 @@ def _lenient_json_loads(text: str) -> tuple[Any, dict[str, int]]:
       sequence no meaning, so the only reading is the literal backslash the
       shell needs: it is doubled. The exception is ``\\'``: JSON does not
       escape single quotes, so it is a plain ``'`` written by habit and the
-      backslash is dropped.
+      backslash is dropped (``sed \\'s/a/b/\\'``), unless it is the escaped
+      apostrophe the code itself needs: between two letters or digits
+      (``Jack\\'s`` in Python or bash) or in bash's ``'\\''`` idiom
+      (``'Berkopec'\\''s'``), where it is kept and so doubled.
     * a bare ``"`` inside a string (``f'{"DIR" if d else "FILE"}'``). The
       decoder ends the string there and then fails on the next character.
       The quote that ended the string is escaped and decoding resumes.
@@ -1594,6 +1628,7 @@ def _lenient_json_loads(text: str) -> tuple[Any, dict[str, int]]:
     """
     fixes = {"escape": 0, "quote": 0}
     s = text
+    loads = functools.partial(json.loads, strict=False, object_pairs_hook=_unique_keys_object)
     # A slip is one character, so a body can carry at most len(text) of
     # them; a generated grep pipeline runs to one every dozen. The budget
     # bounds the quadratic loop (one decode attempt per fix) without
@@ -1601,14 +1636,18 @@ def _lenient_json_loads(text: str) -> tuple[Any, dict[str, int]]:
     budget = max(_MAX_JSON_FIXES, len(text) // 10)
     for _ in range(budget + 1):
         try:
-            return json.loads(s, strict=False), fixes
+            return loads(s), fixes
+        except _DuplicateKey as exc:
+            # A fix that turned string text into structure can read a key
+            # twice; json.loads would keep the last value silently.
+            raise ValueError(f"duplicate key {exc.args[0]!r} after repair") from None
         except json.JSONDecodeError as exc:
             pos = exc.pos
             if exc.msg.startswith(("Invalid \\escape", "Invalid \\uXXXX")):
                 slash = pos if pos < len(s) and s[pos] == "\\" else s.rfind("\\", 0, pos + 1)
                 if slash < 0:
                     raise ValueError(f"{exc.msg} (char {pos})") from None
-                if s.startswith("\\'", slash):
+                if s.startswith("\\'", slash) and not _is_code_apostrophe(s, slash):
                     # JSON never escapes a single quote; "\'" is the habit of
                     # languages that do, and means a plain quote. Doubling it
                     # would hand bash a literal backslash-quote: sed 's/a/b/'
