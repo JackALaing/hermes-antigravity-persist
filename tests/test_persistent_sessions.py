@@ -109,7 +109,7 @@ class FakeAgy:
             self.first = False
             self._emit({"event": "init", "conversation_id": self.conversation,
                         "init": {"model": "m"}})
-        seed = content.startswith("[CONTEXT ONLY")
+        seed = content.startswith(("[CONTEXT ONLY", "[ACTIVE TOOL LOOP"))
         if seed:
             reply = self.world.seed_reply
             if self.world.seed_tool:
@@ -588,6 +588,56 @@ class PersistentSessionTests(unittest.TestCase):
         self.assertEqual(record["agy_size_tokens"], 100 * n + 1000 * n)
         self.assertEqual(usage.prompt_tokens, persist.hermes_request_tokens(history, TOOLS, None))
         self.assertEqual(usage.completion_tokens, 7)
+
+    def test_refresh_mid_tool_loop_spills_an_oversized_loop_into_seeds(self):
+        # A long cron turn (one request, 20+ tool calls) refreshed mid-loop:
+        # the loop alone exceeds one stdin message, so its oldest entries go
+        # to context-only parts and the real turn continues from the tail.
+        client = self._client()
+        history: list[dict] = [{"role": "system", "content": "SYS " * 20_000},
+                               {"role": "user", "content": "LOOP-REQUEST " + "brief the news. " * 3500}]
+        for i in range(22):
+            history.append({"role": "assistant", "content": "", "tool_calls": [
+                {"id": f"c{i}", "type": "function",
+                 "function": {"name": "terminal", "arguments": json.dumps({"command": f"step {i}"})}}]})
+            history.append({"role": "tool", "tool_call_id": f"c{i}",
+                            "content": f"OUT-{i} " + ("big " * 4000 if i in (3, 4, 5) else "x " * 40)})
+        history.append({"role": "assistant", "content": "", "tool_calls": [
+            {"id": "w", "type": "function", "function": {
+                "name": "terminal", "arguments": json.dumps({"command": "write " + "w" * 70_000})}}]})
+        history.append({"role": "tool", "tool_call_id": "w", "content": "NEWEST-RESULT written"})
+        self.world.replies = ["continuing the loop"]
+        chunks = list(self._create(client, history, stream=True))
+        text = "".join(c.choices[0].delta.content or "" for c in chunks if c.choices)
+        self.assertEqual(text, "continuing the loop")
+        received = self.world.procs[0].received
+        n = len(received)
+        self.assertGreaterEqual(n, 2)
+        labels = []
+        for k, payload in enumerate(received, start=1):
+            self.assertLess(persist.utf8_len(payload), persist.MAX_STDIN_BYTES)
+            if k < n:
+                if payload.startswith(f"[CONTEXT ONLY - PART {k} OF {n}."):
+                    labels.append("context")
+                else:
+                    self.assertTrue(payload.startswith(
+                        f"[ACTIVE TOOL LOOP - PART {k} OF {n}. This message carries part of the "
+                        "in-progress tool loop. Do NOT act on it yet"), payload[:80])
+                    labels.append("active")
+        # Every seed here carries the loop (the request opens it), so none is
+        # labelled as older history; the fake agy answers both kinds with ACK.
+        self.assertEqual(labels, ["active"] * (n - 1))
+        final = received[-1]
+        self.assertTrue(final.startswith(f"[PART {n} OF {n}. The earlier parts carried context and the "
+                                         "start of the in-progress tool loop"))
+        self.assertIn("NEWEST-RESULT written", final)
+        self.assertIn("Continue the conversation from the latest tool result", final)
+        self.assertIn("LOOP-REQUEST", final)
+        self.assertTrue(any("User:\nLOOP-REQUEST" in p for p in received[:-1]),
+                        "the loop's oldest entry (the request) is in a seed")
+        record = self._record()
+        assert record is not None
+        self.assertGreater(record["seed_tokens_total"], 0)
 
     def test_each_seed_and_the_real_turn_get_the_full_timeout(self):
         client = self._client()
