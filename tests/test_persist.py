@@ -509,6 +509,29 @@ def _big_history(n, size, char="x"):
     return msgs
 
 
+def _seed_labels(case, out):
+    """Each seed's label ("context" or "active"), checking its header and order.
+
+    Older-history seeds keep ``[CONTEXT ONLY - PART k OF N``; seeds carrying
+    any of a spilled active tool loop use ``[ACTIVE TOOL LOOP - PART k OF N``.
+    The loop is the newest history, so no context-only seed follows one.
+    """
+    n = len(out)
+    labels = []
+    for k, payload in enumerate(out[:-1], start=1):
+        if payload.startswith(f"[CONTEXT ONLY - PART {k} OF {n}. This message restores earlier conversation state."):
+            labels.append("context")
+        elif payload.startswith(f"[ACTIVE TOOL LOOP - PART {k} OF {n}. This message carries part of the "
+                                "in-progress tool loop. Do NOT act on it yet"):
+            labels.append("active")
+            case.assertIn("wait for the final part before continuing. Reply with exactly: ACK]", payload)
+        else:
+            case.fail(f"unexpected seed header: {payload[:80]!r}")
+    case.assertEqual(labels, sorted(labels, key=lambda label: label == "active"),
+                     "active-loop seeds come after every older-history seed")
+    return labels
+
+
 class PackingTests(unittest.TestCase):
     def setUp(self):
         env = patch.dict(os.environ)
@@ -517,15 +540,23 @@ class PackingTests(unittest.TestCase):
         for name in ("ANTIGRAVITY_REFRESH_MAX_TOKENS", "ANTIGRAVITY_REFRESH_SIZE_TOKENS"):
             os.environ.pop(name, None)
 
-    def _assert_well_formed(self, out):
+    def _assert_well_formed(self, out, active_loop=False):
+        """Seeds are older history only, unless ``active_loop`` (a spilled loop)."""
         n = len(out)
+        labels = _seed_labels(self, out)
         for k, payload in enumerate(out, start=1):
             self.assertLess(utf8_len(payload), MAX_STDIN_BYTES)
             if k < n:
-                self.assertTrue(payload.startswith(f"[CONTEXT ONLY - PART {k} OF {n}"), payload[:60])
                 self.assertIn("Reply with exactly: ACK", payload)
             else:
                 self.assertTrue(payload.startswith(f"[PART {n} OF {n}."), payload[:60])
+        if active_loop:
+            self.assertIn("active", labels)
+            self.assertIn("start of the in-progress tool loop", out[-1])
+        else:
+            self.assertEqual(set(labels) - {"context"}, set(), "older history keeps CONTEXT ONLY")
+            if n > 1:
+                self.assertIn("The earlier parts were context only", out[-1])
 
     def test_small_history_is_one_message_without_seed(self):
         out = pack_refresh(HISTORY + [{"role": "user", "content": "hi"}], model="m", tools=TOOLS,
@@ -618,14 +649,35 @@ class PackingTests(unittest.TestCase):
         with self.assertRaises(StdinPayloadTooLarge):
             pack_refresh(msgs, model="m", tools=None, tool_choice=None)
 
-    def test_active_loop_too_large_raises_instead_of_truncating(self):
+    @staticmethod
+    def _loop_of_long_assistant_turns():
         msgs = [{"role": "user", "content": "go"}]
         for i in range(15):
-            msgs.append({"role": "assistant", "content": "a" * 30000,
+            msgs.append({"role": "assistant", "content": f"STEP-{i} " + "a" * 30000,
                          "tool_calls": [_call(f"t{i}", "x", "{}")]})
-            msgs.append({"role": "tool", "tool_call_id": f"t{i}", "content": "z" * 1000})
+            msgs.append({"role": "tool", "tool_call_id": f"t{i}", "content": f"RES-{i} " + "z" * 1000})
+        return msgs
+
+    def test_active_loop_too_large_spills_into_context_only_parts(self):
+        # 450 KB of assistant text in one tool loop: no pruning makes it fit
+        # one message, so its oldest steps go to context-only parts.
+        msgs = self._loop_of_long_assistant_turns()
+        with self.assertLogs("persist", level="WARNING") as logs:
+            out = pack_refresh(msgs, model="m", tools=None, tool_choice=None)
+        self.assertGreater(len(out), 2)
+        self._assert_well_formed(out, active_loop=True)
+        self.assertIn("RES-14 ", out[-1], "the newest tool result is in the final part")
+        self.assertIn("Continue the conversation from the latest tool result", out[-1])
+        self.assertNotIn("STEP-0 ", out[-1])
+        joined = "\n".join(out)
+        positions = [joined.index(f"STEP-{i} ") for i in range(15)]
+        self.assertEqual(positions, sorted(positions), "every step is kept, in order")
+        self.assertIn("does not fit one message", "\n".join(logs.output))
+
+    def test_oneshot_active_loop_too_large_still_raises_instead_of_truncating(self):
+        # A one-shot has no context-only parts to spill into.
         with self.assertRaises(StdinPayloadTooLarge):
-            pack_refresh(msgs, model="m", tools=None, tool_choice=None)
+            pack_oneshot(self._loop_of_long_assistant_turns(), model="m", tools=None, tool_choice=None)
 
     def test_oneshot_pack_is_single_message_under_limit(self):
         msgs = _big_history(400, 2000, "é") + [{"role": "user", "content": "LATEST ASK"}]
@@ -795,6 +847,156 @@ class SummaryAndLoopPackingTests(unittest.TestCase):
         self.assertLess(out.index("[summary truncated to fit]"), out.index("SUM-1 "))
         self.assertNotIn("ordinary ordinary", out, "ordinary history only gets what summaries leave")
         self.assertIn("summary pieces", "\n".join(logs.output))
+
+
+def _pulse_run(request_bytes=54_000, result_chars=15_000):
+    """A news-briefing cron turn: one request, 25 tool calls in parallel batches.
+
+    The shape that failed in production: a ~54 KB request (restated in full in
+    the closing), large write_file arguments, and many 12-20K-char results.
+    """
+    request = "PULSE-REQUEST " + ("brief the news per the skill. " * 4000)[:request_bytes]
+    msgs: list[dict] = [{"role": "system", "content": ("Hermes SOUL and skills. " * 4500)[:100_000]},
+                        {"role": "user", "content": request}]
+    n = 0
+    for batch in (4, 4, 4, 4, 3):
+        calls = [_call(f"c{n + j}", "web_search", json.dumps({"query": f"q{n + j}"})) for j in range(batch)]
+        msgs.append({"role": "assistant", "content": "", "tool_calls": calls})
+        for j in range(batch):
+            msgs.append({"role": "tool", "tool_call_id": f"c{n + j}",
+                         "content": f"OUT-{n + j} " + "headline text. " * (result_chars // 15)})
+        n += batch
+    for size in (36_000, 24_000):  # writing the briefing files
+        args = json.dumps({"path": f"/tmp/brief-{n}.md", "content": f"ARGS-{n} " + "w" * size})
+        msgs.append({"role": "assistant", "content": "", "tool_calls": [_call(f"c{n}", "write_file", args)]})
+        msgs.append({"role": "tool", "tool_call_id": f"c{n}", "content": f"OUT-{n} wrote file"})
+        n += 1
+    for _ in range(4):  # small patches
+        msgs.append({"role": "assistant", "content": "",
+                     "tool_calls": [_call(f"c{n}", "patch", json.dumps({"old": "a", "new": "b"}))]})
+        msgs.append({"role": "tool", "tool_call_id": f"c{n}", "content": f"OUT-{n} patched " + "ok " * 200})
+        n += 1
+    return msgs, n
+
+
+class ActiveLoopSpillTests(unittest.TestCase):
+    """A refresh whose active tool loop alone exceeds one stdin message."""
+
+    def setUp(self):
+        env = patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for name in ("ANTIGRAVITY_REFRESH_MAX_TOKENS", "ANTIGRAVITY_REFRESH_SIZE_TOKENS"):
+            os.environ.pop(name, None)
+
+    def _assert_parts(self, out):
+        n = len(out)
+        self.assertGreaterEqual(n, 2)
+        labels = _seed_labels(self, out)
+        self.assertIn("active", labels, "seeds carrying the loop use the active-tool-loop label")
+        for k, payload in enumerate(out[:-1], start=1):
+            self.assertLess(utf8_len(payload), MAX_STDIN_BYTES)
+            self.assertIn("Reply with exactly: ACK", payload)
+            self.assertNotIn("Continue the conversation from the latest tool result", payload)
+        self.assertLess(utf8_len(out[-1]), MAX_STDIN_BYTES)
+        self.assertTrue(out[-1].startswith(f"[PART {n} OF {n}. The earlier parts carried context and the "
+                                           "start of the in-progress tool loop"), out[-1][:120])
+        return labels
+        self.assertIn("Continue the conversation from the latest tool result", out[-1])
+        self.assertIn("USER REQUEST THIS TOOL LOOP IS SERVING", out[-1])
+
+    def test_pulse_shaped_loop_no_longer_aborts_and_keeps_its_tail_last(self):
+        msgs, calls = _pulse_run()
+        self.assertGreaterEqual(calls, 19)
+        history = [m for m in msgs if m["role"] != "system"]
+        prefix = persist._prefix_sections(msgs, TOOLS, None, None)
+        for keep in persist.TOOL_RETENTION_STEPS:  # the production failure
+            with self.assertRaises(persist._ActiveLoopTooLarge):
+                persist._pack_split(persist._prune_tool_results(history, keep), prefix,
+                                    persist.REFRESH_MAX_TOKENS, None)
+
+        with self.assertLogs("persist", level="WARNING") as logs:
+            out = pack_refresh(msgs, model="m", tools=TOOLS, tool_choice=None)
+        self._assert_parts(out)
+        self.assertIn("does not fit one message", "\n".join(logs.output))
+        final = out[-1]
+        # assertTrue, not assertIn: a failure must not print 160 KB payloads.
+        self.assertTrue("PULSE-REQUEST" in final, "the request is restated in the final part")
+        self.assertTrue((f"OUT-{calls - 1} patched " + "ok " * 200).rstrip() in final,
+                        "the newest result is in the final part, in full")
+        self.assertTrue(f'"id": "c{calls - 1}"' in final, "with the call that produced it")
+        self.assertTrue(any("User:\nPULSE-REQUEST" in p for p in out[:-1]),
+                        "the loop's oldest entry (the request) spilled into a context-only part")
+        joined = "\n".join(out)
+        positions = [joined.index(f"OUT-{i} ") for i in range(calls)]
+        self.assertEqual(positions, sorted(positions), "every tool result is kept, in order")
+        self.assertTrue("ARGS-19 " in joined and "ARGS-20 " in joined, "large arguments are kept")
+        # The canonical retention: the 8 newest results in full, older ones stubbed.
+        self.assertTrue("[... tool output truncated:" in joined)
+        self.assertLessEqual(sum(persist.estimate_tokens(p) for p in out), persist.REFRESH_MAX_TOKENS)
+
+    def test_older_history_seeds_keep_context_only_and_loop_seeds_get_their_own_label(self):
+        msgs = [{"role": "system", "content": "SYS"}]
+        for i in range(40):  # ~320 KB: more than one seed of older history
+            msgs.append({"role": "user", "content": f"OLD-Q{i} " + "q" * 4000})
+            msgs.append({"role": "assistant", "content": f"OLD-A{i} " + "a" * 4000})
+        msgs += PackingTests._loop_of_long_assistant_turns()
+        with self.assertLogs("persist", level="WARNING"):
+            out = pack_refresh(msgs, model="m", tools=TOOLS, tool_choice=None)
+        labels = self._assert_parts(out)
+        self.assertIn("context", labels, "older history still uses the CONTEXT ONLY label")
+        for label, payload in zip(labels, out[:-1]):
+            # The loop opens with its request ("go"), then its steps.
+            if "STEP-" in payload or "User:\ngo" in payload:
+                self.assertEqual(label, "active", payload[:80])
+            else:
+                self.assertEqual(label, "context", payload[:80])
+                self.assertTrue(payload.startswith("[CONTEXT ONLY - PART "))
+        self.assertTrue("OLD-A39 " in "\n".join(out[:-1]), "older history sits in the seeds")
+        self.assertTrue("RES-14 " in out[-1])
+
+    def test_huge_single_entries_are_split_and_the_newest_piece_stays_final(self):
+        cases = (
+            # A 300 KB tool-call argument in the middle of the loop.
+            ("huge arguments", 120_000, 300_000, "LAST-RESULT ok"),
+            # The newest result itself is bigger than the room beside a 150 KB request.
+            ("huge newest result", 150_000, 10, "LAST-RESULT " + "日" * 19_000),
+        )
+        for name, request_bytes, args_bytes, last in cases:
+            with self.subTest(name):
+                msgs = [{"role": "system", "content": "SYS"},
+                        {"role": "user", "content": "ASK " + "r" * request_bytes},
+                        {"role": "assistant", "content": "", "tool_calls": [
+                            _call("w1", "write_file", json.dumps({"content": "BIG-ARGS " + "w" * args_bytes}))]},
+                        {"role": "tool", "tool_call_id": "w1", "content": "MIDDLE-RESULT wrote"},
+                        {"role": "assistant", "content": "", "tool_calls": [_call("r1", "read_file", "{}")]},
+                        {"role": "tool", "tool_call_id": "r1", "content": last}]
+                with self.assertLogs("persist", level="WARNING"):
+                    out = pack_refresh(msgs, model="m", tools=TOOLS, tool_choice=None)
+                self._assert_parts(out)
+                joined = "\n".join(out)
+                self.assertLess(joined.index("BIG-ARGS "), joined.index("MIDDLE-RESULT"))
+                self.assertLess(joined.index("MIDDLE-RESULT"), joined.index("LAST-RESULT"))
+                self.assertTrue(last[-500:] in out[-1], "the newest result's tail is in the final part")
+                if name == "huge arguments":
+                    self.assertTrue("[message continued, piece" in joined)
+                    self.assertTrue("LAST-RESULT ok" in out[-1])
+                else:
+                    self.assertTrue("[message continued, piece" in out[-1])
+
+    def test_request_too_large_for_the_final_part_fails_closed(self):
+        msgs = [{"role": "user", "content": "ASK " + "r" * 176_500},
+                {"role": "assistant", "content": "", "tool_calls": [_call("r1", "read_file", "{}")]},
+                {"role": "tool", "tool_call_id": "r1", "content": "result"}]
+        with self.assertRaises(StdinPayloadTooLarge) as ctx:
+            pack_refresh(msgs, model="m", tools=TOOLS, tool_choice=None)
+        self.assertNotIsInstance(ctx.exception, persist._ActiveLoopTooLarge)
+        self.assertIn("leaving no room", str(ctx.exception))
+        # Hermes still compacts on it, as on every stdin-limit error.
+        from providers import get_provider_profile
+        hook = get_provider_profile("antigravity-subscription-directsdk").classify_api_error
+        self.assertEqual(hook(ctx.exception),
+                         {"reason": "context_overflow", "retryable": True, "should_compress": True})
 
 
 class HermesRequestTokensTests(unittest.TestCase):

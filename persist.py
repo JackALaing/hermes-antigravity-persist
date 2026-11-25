@@ -101,6 +101,9 @@ MAX_STDIN_BYTES = 180_000
 PREFIX_MAX_BYTES = 170_000
 # Room kept free in every message for part headers and the media section.
 _HEADER_RESERVE = 2_048
+# Least room the closing must leave in the final part for the newest tail of
+# an active tool loop that is spread over context-only parts.
+_MIN_FINAL_ROOM = 4_096
 LOCK_TIMEOUT_SECONDS = 30.0
 RECORD_MAX_AGE_SECONDS = 14 * 24 * 3600
 # agy's own logs in the shared persistent home (one per worker process).
@@ -118,6 +121,19 @@ SEED_HEADER = (
 FINAL_HEADER = (
     "[PART {n} OF {n}. The earlier parts were context only and are now complete. "
     "Answer the request at the end of this message normally.]"
+)
+# Seeds that carry part of an in-progress tool loop (a refresh whose active
+# loop alone exceeds one message) get their own label, so the model does not
+# take the loop for finished history; older-history seeds keep SEED_HEADER.
+ACTIVE_LOOP_HEADER = (
+    "[ACTIVE TOOL LOOP - PART {k} OF {n}. This message carries part of the in-progress tool loop. "
+    "Do NOT act on it yet, do NOT call any tools (neither <tool_call> blocks nor native tools), "
+    "and wait for the final part before continuing. Reply with exactly: ACK]"
+)
+ACTIVE_LOOP_FINAL_HEADER = (
+    "[PART {n} OF {n}. The earlier parts carried context and the start of the in-progress tool loop, "
+    "and are now complete. The newest part of the loop follows; continue it and answer the request "
+    "at the end of this message normally.]"
 )
 
 
@@ -1156,7 +1172,9 @@ def pack_refresh(
     oldest first, behind an "N earlier messages omitted" marker, with a
     warning. Old tool output is cut to a stub as in the canonical prompt, and
     more of it when the active loop would not fit otherwise
-    (``TOOL_RETENTION_STEPS``).
+    (``TOOL_RETENTION_STEPS``). A loop that fits no single message even then
+    is spread over the last seeds at the canonical retention; the final part
+    keeps its newest entries beside the restated request.
 
     ``max_messages=1`` (one-shot) instead keeps the newest history that fits
     one message and omits the rest, with a warning.
@@ -1189,7 +1207,15 @@ def pack_refresh(
             )
         return payloads
     assert failure is not None
-    raise failure
+    if single:
+        raise failure
+    # Even with every tool result cut to a stub the loop does not fit one
+    # message (a long request restated in the closing, large tool-call
+    # arguments). Spill its oldest entries into context-only parts instead,
+    # at the canonical retention, so the final part keeps the newest tool
+    # results in full.
+    return _pack_split(_prune_tool_results(history, TOOL_RETENTION_STEPS[0]), prefix, cap,
+                       media_sink, spill_active=True)
 
 
 def _pack_single(history: list[dict[str, Any]], prefix: list[str], media_sink: Optional[set]) -> list[str]:
@@ -1238,9 +1264,32 @@ def _pack_single(history: list[dict[str, Any]], prefix: list[str], media_sink: O
 
 
 def _pack_split(history: list[dict[str, Any]], prefix: list[str], cap: int,
-                media_sink: Optional[set]) -> list[str]:
+                media_sink: Optional[set], spill_active: bool = False) -> list[str]:
+    """Context-only seeds, then a final part with the closing.
+
+    The final part normally carries the whole active loop. With
+    ``spill_active`` the loop's oldest entries may go to the last seeds
+    instead: the final part then holds the newest tail of the loop that fits
+    beside the closing, which restates the request the loop serves. Seeds
+    that carry any of the loop are labelled ``ACTIVE_LOOP_HEADER`` (and the
+    final part ``ACTIVE_LOOP_FINAL_HEADER``); seeds of older history keep
+    ``SEED_HEADER``.
+    """
     summaries, older, active, closing = _split_history(history, media_sink)
     capacity = MAX_STDIN_BYTES - _HEADER_RESERVE
+    final_base = _joined_len(closing) + 64
+    final_room = capacity - final_base
+    if spill_active and final_room < _MIN_FINAL_ROOM:
+        # The closing is the request itself (restated verbatim): it cannot be
+        # split across parts without the model losing what it has to answer.
+        # The wording must keep "exceeds agy's stdin limit": Hermes compacts
+        # on it (__init__._classify_antigravity_error).
+        raise StdinPayloadTooLarge(
+            f"Antigravity prompt: the latest request and its instructions "
+            f"({_joined_len(closing):,} UTF-8 bytes) plus the tool loop it serves exceed agy's "
+            f"stdin limit of {MAX_STDIN_BYTES:,} bytes per message, leaving no room for the loop "
+            "in the final part; refusing to send a truncated prompt."
+        )
 
     # Token cap over the whole rebuild: the prefix, the summaries, the request
     # and its active loop are mandatory; older history fills the rest, newest
@@ -1259,17 +1308,31 @@ def _pack_split(history: list[dict[str, Any]], prefix: list[str], cap: int,
 
     head_pieces = _presplit(summaries, capacity // 2) + marker
     older_pieces = _presplit(kept, capacity // 2)
-    active_pieces = _presplit(active, capacity // 2)
+    # When spilling, no active piece may exceed the room beside the closing,
+    # so the final part always carries at least the loop's newest piece.
+    # (2 bytes for the separator _fill_from_end counts per entry).
+    active_pieces = _presplit(active, min(capacity // 2, final_room - 2) if spill_active else capacity // 2)
     entries = head_pieces + older_pieces + active_pieces
-    final_entries = _fill_from_end(entries, capacity, _joined_len(closing) + 64)
-    # The active loop must sit in the final part.
-    _require_active(len(entries), len(head_pieces) + len(older_pieces))
+    final_entries = _fill_from_end(entries, capacity, final_base)
+    if not spill_active:
+        # The active loop must sit in the final part.
+        _require_active(len(entries), len(head_pieces) + len(older_pieces))
+    elif len(entries) > len(head_pieces) + len(older_pieces):
+        spilled = len(entries) - len(head_pieces) - len(older_pieces)
+        logger.warning(
+            "Antigravity refresh rebuild: the active tool loop does not fit one message; its %d "
+            "oldest piece(s) go to active-tool-loop parts and the final part keeps the newest %d",
+            spilled, len(active_pieces) - spilled,
+        )
 
     if not entries and _joined_len(prefix) + _joined_len(final_entries) \
             + _joined_len(closing) + 256 < capacity:
         # Only the cap forced a split: everything that is left fits one message.
         return [_single_message(prefix, [], final_entries, closing)]
 
+    # Entries past this index are pieces of the active loop (only present in
+    # the seeds when spilling).
+    history_count = len(head_pieces) + len(older_pieces)
     chunks: list[list[str]] = [_fill_forward(entries, capacity, _joined_len(prefix) + 128)]
     while entries:
         chunk = _fill_forward(entries, capacity, 128)
@@ -1279,8 +1342,14 @@ def _pack_split(history: list[dict[str, Any]], prefix: list[str], cap: int,
 
     total = len(chunks) + 1
     payloads = []
+    consumed = 0
+    loop_spilled = False
     for k, chunk in enumerate(chunks, start=1):
-        sections = [SEED_HEADER.format(k=k, n=total)]
+        consumed += len(chunk)
+        carries_loop = consumed > history_count
+        loop_spilled = loop_spilled or carries_loop
+        header = ACTIVE_LOOP_HEADER if carries_loop else SEED_HEADER
+        sections = [header.format(k=k, n=total)]
         if k == 1:
             sections.extend(prefix)
             label = "Conversation transcript (earlier part):"
@@ -1289,7 +1358,8 @@ def _pack_split(history: list[dict[str, Any]], prefix: list[str], cap: int,
         if chunk:
             sections.append(label + "\n\n" + "\n\n".join(chunk))
         payloads.append(_join(sections))
-    payloads.append(_final_message(FINAL_HEADER.format(n=total), final_entries, closing))
+    final_header = ACTIVE_LOOP_FINAL_HEADER if loop_spilled else FINAL_HEADER
+    payloads.append(_final_message(final_header.format(n=total), final_entries, closing))
     logger.info(
         "Antigravity refresh rebuild: %d message(s), ~%d estimated tokens, %d history message(s) omitted",
         len(payloads), sum(estimate_tokens(p) for p in payloads), omitted,
