@@ -1071,6 +1071,27 @@ class ByteGuardTests(unittest.TestCase):
         positions = [joined.index(f"OUT-{i} ") for i in range(40)]
         self.assertEqual(positions, sorted(positions))
 
+    def test_long_request_tool_step_delta_restates_an_excerpt(self):
+        # Pulse: a 54 KB request re-pasted on every tool step of a persistent turn.
+        request = "PULSE-REQUEST " + "brief the news per the skill. " * 1800
+        delta = [{"role": "assistant", "content": "", "tool_calls": [_call("c1", "web_search", "{}")]},
+                 {"role": "tool", "tool_call_id": "c1", "content": "OUT-1 headlines"}]
+        out = split_delta(delta, pending_user_text=request)
+        self.assertEqual(len(out), 1)
+        self.assertLess(utf8_len(out[0]), 4_000)
+        self.assertIn("PULSE-REQUEST", out[0])
+        self.assertIn("appears earlier in this conversation", out[0])
+        self.assertNotIn(request, out[0])
+
+    def test_rebuild_still_restates_a_long_request_in_full(self):
+        request = "PULSE-REQUEST " + "brief the news per the skill. " * 1800 + "END"
+        msgs = [{"role": "system", "content": "SYS"}, {"role": "user", "content": request},
+                {"role": "assistant", "content": "", "tool_calls": [_call("c1", "web_search", "{}")]},
+                {"role": "tool", "tool_call_id": "c1", "content": "OUT-1 headlines"}]
+        out = pack_refresh(msgs, model="m", tools=TOOLS, tool_choice=None)
+        tail = out[-1][out[-1].index("USER REQUEST THIS TOOL LOOP IS SERVING"):]
+        self.assertTrue(request in tail, "the rebuild's closing keeps the whole request")
+
     def test_single_huge_message_is_split_across_seeds(self):
         delta = [{"role": "user", "content": "PASTE " + "q" * 400_000},
                  {"role": "assistant", "content": "ok"}, {"role": "user", "content": "now answer"}]

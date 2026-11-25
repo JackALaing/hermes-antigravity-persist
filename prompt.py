@@ -912,6 +912,35 @@ def _pending_user_request_section(user_text: str) -> str:
     )
 
 
+# A turn-by-turn update (a delta sent into a conversation that already holds
+# the request) restates the request its tool loop serves at the tail. A long
+# request (a skill-driven cron prompt can run to 50 KB) re-pasted on every
+# tool step grows the agy conversation by its whole size per step, so updates
+# restate a bounded excerpt with a pointer back to the full text instead.
+PENDING_REQUEST_FULL_MAX_CHARS = 4_000
+_PENDING_REQUEST_HEAD_CHARS = 1_500
+_PENDING_REQUEST_TAIL_CHARS = 500
+
+
+def _pending_request_excerpt(user_text: str) -> str:
+    """*user_text* itself, or its head and tail when it is long.
+
+    Only for updates: the full request must already be in the conversation
+    (an earlier turn, or an entry of the same update), which the omission
+    marker points the model to.
+    """
+    if len(user_text) <= PENDING_REQUEST_FULL_MAX_CHARS:
+        return user_text
+    head = user_text[:_PENDING_REQUEST_HEAD_CHARS]
+    tail = user_text[-_PENDING_REQUEST_TAIL_CHARS:]
+    omitted = len(user_text) - len(head) - len(tail)
+    return (
+        f"{head}\n[... {omitted:,} characters of this request omitted here; the full request "
+        f"({len(user_text):,} characters) appears earlier in this conversation. Follow the full "
+        f"request, not just this excerpt ...]\n{tail}"
+    )
+
+
 def _tool_loop_objective_section(user_text: str) -> str:
     """Anchor the request a tool loop serves above the transcript.
 
@@ -1393,12 +1422,19 @@ def _delta_parts(
     new_messages: Sequence[dict[str, Any]],
     pending_user_text: str = "",
     media_sink: Optional[set] = None,
+    *,
+    full_pending_request: bool = False,
 ) -> tuple[list[str], list[str]]:
     """Transcript entries and closing sections of a delta prompt.
 
     Split out of _format_delta_prompt so callers that must spread a delta
     across several stdin writes (persist.py) keep the exact same rendering.
     A trailing user request is not an entry: it is restated in the closing.
+
+    A tool-loop or recovery closing restates *pending_user_text*, which the
+    conversation already holds, as a bounded excerpt
+    (``_pending_request_excerpt``); ``full_pending_request`` keeps it whole
+    (a persistent rebuild's closing, sent once per rebuild).
     """
     valid_messages = [m for m in new_messages if isinstance(m, dict)]
     if not valid_messages:
@@ -1419,6 +1455,9 @@ def _delta_parts(
         if entry
     ]
 
+    def restate(text: str) -> str:
+        return text if full_pending_request else _pending_request_excerpt(text)
+
     closing: list[str] = []
     if last_role == "tool":
         closing.append(
@@ -1428,9 +1467,12 @@ def _delta_parts(
             "Never invoke native tools or emit native functionCall blocks."
         )
         if pending_user_text:
-            closing.append(_pending_user_request_section(pending_user_text))
+            closing.append(_pending_user_request_section(restate(pending_user_text)))
     elif last_role == "user":
-        user_text = (pending_user_text or _latest_user_text(valid_messages)) if recovery_turn else _render_message_content(last_msg.get("content"), media_sink)
+        if recovery_turn:
+            user_text = restate(pending_user_text or _latest_user_text(valid_messages))
+        else:
+            user_text = _render_message_content(last_msg.get("content"), media_sink)
         if user_text:
             closing.append(_latest_user_request_section(user_text))
     else:
