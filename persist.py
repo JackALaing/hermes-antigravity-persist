@@ -1068,7 +1068,10 @@ def _split_history(history: list[dict[str, Any]], media_sink: Optional[set]):
         entry = _render_transcript_entry(message)
         if entry:
             (summaries if is_summary_message(message) else older).append(entry)
-    active, closing = _delta_parts(history[loop_start:], _latest_user_text(history), media_sink)
+    # The closing restates the request in full: a rebuild sends it once, and
+    # it is the anchor the final part answers.
+    active, closing = _delta_parts(history[loop_start:], _latest_user_text(history), media_sink,
+                                   full_pending_request=True)
     return summaries, older, active, closing
 
 
